@@ -692,7 +692,12 @@ void translator_hbp_voice_received(translator *tr, const uint8_t *dmrd, int len)
 
 void translator_check_call_timeouts(translator *tr)
 {
-    double timeout = 10.0;
+    /* Dead-man cleanup for a lost VOICE_TERM with no follow-on call (a real new
+     * call resets stale state inline via RTP discontinuity).  2 s keeps the
+     * logged call-end close to reality; it sits well above every in-call wait
+     * (60 ms burst, 120 ms jitter, 360 ms synth).  Rides the ~5 s watchdog, so
+     * effective clearing is ~2-7 s — fine for a dead-man. */
+    double timeout = 2.0;
     double now = ev_now(tr->loop);
     for (int ts = 1; ts <= 2; ts++) {
         if (tr->out_has_stream[ts]) {
