@@ -17,6 +17,13 @@
 #define MAX_SYNTH_BURSTS    6
 #define SLOT_MS             0.060
 
+/* IPSC->HBP call-boundary threshold. Current XPR8400 firmware churns the IPSC
+ * call-seq (byte 5) every superframe when Talker Alias is interleaved, so it is
+ * not a call boundary. A genuinely new call resets the 8 kHz RTP timestamp base
+ * (large forward/backward jump); within a call it advances ~480/burst, and a few
+ * dropped bursts stay well under this bound. TODO(field-tune). */
+#define OUT_RTP_MAX_FWD 8000u   /* max forward RTP-timestamp jump still same call (~1 s) */
+
 struct deliv_ctx { translator *tr; int ts; };
 
 struct translator {
@@ -39,6 +46,8 @@ struct translator {
     uint8_t  out_emb[3][4][4];
     int      out_ts_mismatch_warned[3];
     double   out_last_pkt[3];
+    uint32_t out_last_rtp_ts[3];      /* last IPSC RTP timestamp seen (continuity anchor) */
+    int      out_has_rtp[3];          /* whether out_last_rtp_ts[ts] holds a value yet */
 
     /* inbound (HBP -> IPSC) */
     int      in_has_lc[3];
@@ -224,6 +233,7 @@ static void init_call_state(translator *tr)
     memset(tr->out_has_lc, 0, sizeof tr->out_has_lc);
     memset(tr->out_has_emb, 0, sizeof tr->out_has_emb);
     tr->out_last_pkt[1]=tr->out_last_pkt[2]=0.0;
+    tr->out_has_rtp[1]=tr->out_has_rtp[2]=0;
     tr->out_ts_mismatch_warned[1]=tr->out_ts_mismatch_warned[2]=0;
     memset(tr->in_has_lc, 0, sizeof tr->in_has_lc);
     memset(tr->in_has_emb, 0, sizeof tr->in_has_emb);
@@ -257,6 +267,31 @@ void translator_hbp_disconnected(translator *tr) { LOGW(LOGN, "HBP disconnected"
 
 /* ---------------- outbound: IPSC -> HBP ---------------- */
 
+/* Clear all IPSC->HBP per-call state for a timeslot. */
+static void out_reset_call(translator *tr, int ts)
+{
+    tr->out_has_stream[ts]     = 0;
+    tr->out_ipsc_stream_id[ts] = -1;
+    tr->out_has_lc[ts]         = 0;
+    tr->out_has_emb[ts]        = 0;
+}
+
+/* True if the current IPSC voice frame continues the active out-call.  Replaces
+ * the old call-seq (byte 5) comparison, which current XPR8400 firmware breaks by
+ * churning the call-seq every superframe when Talker Alias is interleaved.  A
+ * new/different call resets the 8 kHz RTP base (large forward/backward jump);
+ * within a call it advances ~480/burst, so a small forward delta — including a
+ * few dropped bursts — is still the same call.  Sustained silence is a separate
+ * concern (handled elsewhere/by the watchdog). */
+static int out_call_continues(uint32_t rtp_now, int has_rtp, uint32_t prev_rtp, int prev_has_rtp)
+{
+    if (has_rtp && prev_has_rtp) {
+        uint32_t delta = rtp_now - prev_rtp;   /* unsigned wrap: a backward jump becomes large */
+        if (delta > OUT_RTP_MAX_FWD) return 0;
+    }
+    return 1;
+}
+
 void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len, int ts, int burst_type)
 {
     if (!hbp_is_connected(tr->hb)) return;
@@ -278,7 +313,18 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
         }
     }
 
+    /* RTP timestamp continuity (captured before updating the per-ts tracker). */
+    uint32_t rtp_now = 0; int has_rtp = 0;
+    if (len >= GV_RTP_TS_OFF + 4) {
+        rtp_now = ((uint32_t)data[GV_RTP_TS_OFF] << 24) | ((uint32_t)data[GV_RTP_TS_OFF+1] << 16)
+                | ((uint32_t)data[GV_RTP_TS_OFF+2] << 8) | (uint32_t)data[GV_RTP_TS_OFF+3];
+        has_rtp = 1;
+    }
+    uint32_t prev_rtp = tr->out_last_rtp_ts[ts];
+    int prev_has_rtp  = tr->out_has_rtp[ts];
+
     tr->out_last_pkt[ts] = ev_now(tr->loop);
+    if (has_rtp) { tr->out_last_rtp_ts[ts] = rtp_now; tr->out_has_rtp[ts] = 1; }
 
     const uint8_t *src_sub   = data + GV_SRC_SUB_OFF;
     const uint8_t *dst_group = data + GV_DST_GROUP_OFF;
@@ -304,7 +350,7 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
             rand4(tr->out_stream_id[ts]);
             tr->out_has_stream[ts] = 1;
             tr->out_ipsc_stream_id[ts] = ipsc_stream_id;
-            LOGI(LOGN, "IPSC call start: src=%u  tg=%u  ts=%d  stream=%s  ipsc_id=0x%02x",
+            LOGI(LOGN, "IPSC call start: src=%u  tg=%u  ts=%d  stream=%s  int_seq_id=0x%02x",
                  (unsigned)(src_sub[0]<<16|src_sub[1]<<8|src_sub[2]),
                  (unsigned)(dst_group[0]<<16|dst_group[1]<<8|dst_group[2]),
                  ts, log_hex(tr->out_stream_id[ts], 4), ipsc_stream_id);
@@ -339,28 +385,41 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
         dmr_bits_to_bytes(fb, 264, payload_33);
         flags |= HBPF_FRAMETYPE_DATASYNC | HBPF_SLT_VTERM;
     } else {
-        /* SLOT1_VOICE / SLOT2_VOICE */
-        if (tr->out_has_stream[ts] && tr->out_ipsc_stream_id[ts] >= 0 &&
-            tr->out_ipsc_stream_id[ts] != ipsc_stream_id) {
-            LOGW(LOGN, "IPSC stream ID changed on ts=%d (0x%02x->0x%02x) mid-stream "
-                       "— prior call ended without VOICE_TERM, clearing stale state",
-                 ts, tr->out_ipsc_stream_id[ts], ipsc_stream_id);
-            tr->out_has_stream[ts]=0; tr->out_ipsc_stream_id[ts]=-1;
-            tr->out_has_lc[ts]=0; tr->out_has_emb[ts]=0;
+        /* SLOT1_VOICE / SLOT2_VOICE.  Boundary detection: the IPSC call-seq (byte 5) is
+         * deliberately NOT consulted — current XPR8400 firmware mints a new call-seq every
+         * superframe when Talker Alias is interleaved (and stuffs alias bytes into the
+         * header src/dst on the TA superframes).  A genuinely different call shows up as an
+         * RTP-timestamp discontinuity instead. */
+        if (tr->out_has_stream[ts] &&
+            !out_call_continues(rtp_now, has_rtp, prev_rtp, prev_has_rtp)) {
+            LOGI(LOGN, "IPSC call end ts=%d stream=%s — RTP discontinuity, no VOICE_TERM",
+                 ts, log_hex(tr->out_stream_id[ts], 4));
+            out_reset_call(tr, ts);
         }
         if (!tr->out_has_stream[ts]) {
-            if (len <= 32 || data[32] != 0x16) return;   /* only Burst E gives late entry */
+            /* Late entry: anchor identity ONLY to a GVCU burst E.  A burst E carrying
+             * Talker Alias / GPS (FLCO != GROUP at byte 56) puts alias bytes in the header
+             * src/dst, so we must not adopt them — wait for the next GVCU superframe. */
+            if (len <= GV_BE_LC_FLCO_OFF || data[32] != GV_BE_FLAG) return;
+            if (data[GV_BE_LC_FLCO_OFF] != FLCO_GROUP) {
+                LOGD(LOGN, "IPSC late entry deferred ts=%d — burst E embedded LC is non-GVCU "
+                           "(flco=0x%02x, Talker Alias/GPS); waiting for GVCU superframe",
+                     ts, data[GV_BE_LC_FLCO_OFF]);
+                return;
+            }
             uint8_t lc[9]; memcpy(lc, DMR_LC_OPT, 3); memcpy(lc+3, dst_group, 3); memcpy(lc+6, src_sub, 3);
             rand4(tr->out_stream_id[ts]); tr->out_has_stream[ts]=1;
             tr->out_ipsc_stream_id[ts]=ipsc_stream_id;
             memcpy(tr->out_lc[ts], lc, 9); tr->out_has_lc[ts]=1;
             dmr_encode_emblc(lc, tr->out_emb[ts]); tr->out_has_emb[ts]=1;
             tr->out_frame_pos[ts]=4;
-            LOGI(LOGN, "IPSC late entry: ts=%d src=%u tg=%u — LC from Burst E, stream=%s  ipsc_id=0x%02x",
+            LOGI(LOGN, "IPSC late entry: ts=%d src=%u tg=%u — LC from GVCU Burst E, stream=%s  int_seq_id=0x%02x",
                  ts, (unsigned)(src_sub[0]<<16|src_sub[1]<<8|src_sub[2]),
                  (unsigned)(dst_group[0]<<16|dst_group[1]<<8|dst_group[2]),
                  log_hex(tr->out_stream_id[ts], 4), ipsc_stream_id);
         }
+        /* Continuation: per-frame header src/dst and call-seq are ignored (may be alias
+         * bytes on a TA superframe); all AMBE is forwarded under the locked identity. */
         if (len < 52) { LOGW(LOGN, "SLOT_VOICE too short for AMBE: %d bytes", len); return; }
 
         dmr_bit raw[152]; dmr_bytes_to_bits(data + 33, 19, raw);
@@ -381,12 +440,21 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
         tr->out_frame_pos[ts]++;
     }
 
+    /* Forward under the LOCKED call identity (from out_lc), never the per-frame header —
+     * on a Talker Alias superframe the header src/dst are alias bytes. */
+    uint8_t fb_lc[9];
+    const uint8_t *locked_lc;
+    if (tr->out_has_lc[ts]) { locked_lc = tr->out_lc[ts]; }
+    else { memcpy(fb_lc, DMR_LC_OPT, 3); memcpy(fb_lc+3, dst_group, 3); memcpy(fb_lc+6, src_sub, 3); locked_lc = fb_lc; }
+    const uint8_t *out_dst = locked_lc + 3;
+    const uint8_t *out_src = locked_lc + 6;
+
     uint8_t dmrd[DMRD_LEN];
     int p = 0;
     memcpy(dmrd+p, "DMRD", 4); p+=4;
     dmrd[p++] = (uint8_t)tr->out_seq;
-    memcpy(dmrd+p, src_sub, 3); p+=3;
-    memcpy(dmrd+p, dst_group, 3); p+=3;
+    memcpy(dmrd+p, out_src, 3); p+=3;
+    memcpy(dmrd+p, out_dst, 3); p+=3;
     memcpy(dmrd+p, tr->repeater_id_b, 4); p+=4;
     dmrd[p++] = (uint8_t)flags;
     memcpy(dmrd+p, tr->out_stream_id[ts], 4); p+=4;
@@ -396,12 +464,11 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
     hbp_send_dmrd(tr->hb, dmrd, p);
 
     if (burst_type == VOICE_TERM) {
-        LOGI(LOGN, "IPSC call end:   src=%u  tg=%u  ts=%d  stream=%s  ipsc_id=0x%02x",
-             (unsigned)(src_sub[0]<<16|src_sub[1]<<8|src_sub[2]),
-             (unsigned)(dst_group[0]<<16|dst_group[1]<<8|dst_group[2]),
+        LOGI(LOGN, "IPSC call end:   src=%u  tg=%u  ts=%d  stream=%s  int_seq_id=0x%02x",
+             (unsigned)(out_src[0]<<16|out_src[1]<<8|out_src[2]),
+             (unsigned)(out_dst[0]<<16|out_dst[1]<<8|out_dst[2]),
              ts, log_hex(tr->out_stream_id[ts], 4), tr->out_ipsc_stream_id[ts]);
-        tr->out_has_stream[ts]=0; tr->out_ipsc_stream_id[ts]=-1;
-        tr->out_has_lc[ts]=0; tr->out_has_emb[ts]=0;
+        out_reset_call(tr, ts);
     }
 }
 

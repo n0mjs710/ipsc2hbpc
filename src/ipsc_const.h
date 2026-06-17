@@ -47,13 +47,19 @@
 
 /* GROUP_VOICE field offsets */
 #define GV_PEER_ID_OFF    1
-#define GV_CALL_SEQ_OFF   5
-#define GV_SRC_SUB_OFF    6
-#define GV_DST_GROUP_OFF  9
+#define GV_CALL_SEQ_OFF   5    /* normally constant within a call, but current XPR8400 firmware mints a
+                                  new value every superframe when Talker Alias is interleaved — NOT a
+                                  call boundary; anchor on RTP-timestamp continuity instead */
+#define GV_SRC_SUB_OFF    6    /* alias bytes on a Talker Alias superframe */
+#define GV_DST_GROUP_OFF  9    /* alias bytes on a Talker Alias superframe */
 #define GV_CALL_INFO_OFF  17
+#define GV_RTP_TS_OFF     22   /* RTP timestamp (8 kHz, +480/burst) — per-call continuity anchor */
 #define GV_BURST_TYPE_OFF 30
 #define GV_PAYLOAD_OFF    31
 #define GV_MIN_LEN        31
+#define GV_BE_FLAG        0x16 /* data[32] value identifying burst E (carries reassembled LC repeat) */
+#define GV_BE_LC_FLCO_OFF 56   /* FLCO of the reassembled LC repeat carried only on burst E */
+#define FLCO_GROUP        0x00 /* Group Voice Channel User (real call identity); 0x04-0x08 = TA/GPS */
 
 #define AUTH_DIGEST_LEN   10
 
