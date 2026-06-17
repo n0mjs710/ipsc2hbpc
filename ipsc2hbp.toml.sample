@@ -1,0 +1,224 @@
+# ipsc2hbp.toml — configuration for ipsc2hbpc
+#
+# This file is config-compatible with the original Python ipsc2hbp: an existing
+# ipsc2hbp.toml works unchanged.  Copy this file to ipsc2hbp.toml (or
+# /etc/ipsc2hbp/ipsc2hbp.toml) and edit for your deployment.  The live config
+# is gitignored.
+
+[global]
+# Logging verbosity: "DEBUG" | "INFO" | "WARNING" | "ERROR"
+# DEBUG is very noisy (every burst frame). Use INFO for normal operation.
+log_level = "INFO"
+
+[ipsc]
+# IPSC connection mode: "MASTER" (default) or "PEER"
+#
+# MASTER: ipsc2hbp acts as the IPSC master node.  Repeaters register with it.
+#   Use this when you control the IPSC master role (the typical deployment).
+#
+# PEER: ipsc2hbp registers with an existing IPSC master (e.g., a repeater
+#   configured as master, or another MOTOTRBO system you do not control).
+#   All traffic on the IPSC system is visible and forwarded to HBP.
+#   Peer mode also enables passive capture of SYSTEM_MAP packets (0x9C/0x9D),
+#   which are logged at INFO with full hex when observed — useful for protocol
+#   research while running CPS against the repeater master.
+mode = "MASTER"
+
+# Peer mode only: address of the IPSC master to connect to.
+# In master mode these fields are ignored.
+# master_ip   = "192.168.1.100"
+# master_port = 50000
+
+# IP address to bind the local IPSC UDP socket.
+# In master mode:  the address repeaters connect to (must match codeplug).
+# In peer mode:    the local source address for our outbound connection.
+# Use "0.0.0.0" to bind on all interfaces.
+bind_ip   = "0.0.0.0"
+bind_port = 50000
+
+# Radio ID this translator presents on the IPSC network.
+# In master mode:  the ID repeaters see as the master node.
+# In peer mode:    the ID we register with to the master.
+# Must be unique on the IPSC system.  This is NOT the repeater's own radio ID.
+ipsc_master_id = 9999999
+
+# Optional: restrict which repeater radio IDs may register.
+# TOML array of integers. Omit or leave empty ([]) to accept any radio ID.
+# IPSC supports 15 peers maximum including the master, so at most 14 may connect.
+# allowed_peer_ids = [3120000, 3120001]
+allowed_peer_ids = []
+
+# Optional: restrict which source IP addresses may register.
+# TOML array of strings. Omit or leave empty ([]) to accept any source IP.
+# allowed_peer_ips = ["192.168.1.100", "192.168.1.101"]
+allowed_peer_ips = []
+
+# IPSC HMAC-SHA1 authentication.
+# Must match the auth key programmed in the repeater codeplug.
+auth_enabled = false
+
+# Auth key: up to 40 hex characters (20 bytes).
+# Shorter keys are left-zero-padded to 40 hex chars automatically.
+# Leave empty ("") when auth_enabled = false.
+auth_key = ""
+
+# Watchdog timeout (seconds): how long without a keep-alive before the
+# peer/master is declared lost.  Set generously for variable firewall timers.
+# Minimum: 5.  Recommended: 60.
+keepalive_watchdog = 60
+
+# Keepalive send interval (seconds) — peer mode only.
+# How often ipsc2hbp sends MASTER_ALIVE_REQ to the master.
+# 5 seconds matches the Motorola default interval.
+# In master mode this field is unused; repeaters drive their own keepalives.
+# keepalive_interval = 5
+
+# Missed keepalive limit — peer mode only.
+# How many consecutive MASTER_ALIVE_REQs can go unanswered before ipsc2hbp
+# declares the master lost and re-registers.  At keepalive_interval=5 and
+# keepalive_missed_max=3, failure is detected within ~15 seconds.
+# keepalive_missed_max = 3
+
+# ---------------------------------------------------------------------------
+# DMRlink confbridge.py timeslot compatibility
+#
+# In an IPSC GROUP_VOICE packet, the active timeslot is encoded in two places:
+#   • call_info byte 17, bit 5  (used for VOICE_HEAD and VOICE_TERM)
+#   • burst_type byte 30, bit 7 (used for SLOT_VOICE bursts: 0x0A=TS1, 0x8A=TS2)
+#
+# Real Motorola hardware always writes both fields consistently.  DMRlink's
+# confbridge.py, when translating a call from TS1 to TS2, rewrites call_info
+# (byte 17) correctly but does NOT rewrite burst_type (byte 30).  This causes
+# ipsc2hbp to route SLOT_VOICE bursts to the wrong timeslot, producing a phantom
+# stream on the incorrect TS while the real call forwards only the voice header.
+#
+# When ts_prefer_call_info = false (default): ipsc2hbp uses burst_type bit 7 for
+#   SLOT_VOICE TS determination, which is the correct protocol-defined source.  A
+#   WARNING is logged once per session per affected TS whenever the two fields
+#   disagree, making the confbridge problem immediately visible in the log.
+#
+# When ts_prefer_call_info = true: ipsc2hbp uses call_info bit 5 for ALL burst
+#   types, including SLOT_VOICE.  This works around confbridge's incomplete rewrite
+#   without requiring a DMRlink update.  Set this if your IPSC source passes through
+#   DMRlink confbridge for timeslot translation.  Remove or set false once confbridge
+#   is updated to rewrite both fields.
+# ---------------------------------------------------------------------------
+ts_prefer_call_info = false
+
+# ---------------------------------------------------------------------------
+# IPSC capability advertisement
+#
+# WARNING: These fields control what ipsc2hbp tells IPSC peers about its
+# capabilities during registration and keepalive.  Advertising capabilities
+# that are not actually supported can confuse repeaters or cause unexpected
+# behaviour.  The safe defaults have been verified against real hardware.
+#
+# use_safe_defaults = true  →  all settings below are ignored; ipsc2hbp
+#   uses proven working values identical to its original behaviour.
+#
+# use_safe_defaults = false →  ipsc2hbp advertises exactly what you
+#   configure below.  Only change this if you have a specific reason and
+#   a wire capture to verify the result.
+# ---------------------------------------------------------------------------
+[ipsc.capabilities]
+use_safe_defaults = true
+
+# Radio mode advertised to IPSC peers.
+# "DIGITAL"  — digital repeater (default; correct for a standard MOTOTRBO system)
+# "ANALOG"   — analog repeater
+# "NO_RADIO" — no radio / software application (e.g. a console or programming tool)
+# "MIXED"    — site handles both analog and digital (rare)
+# radio_mode = "DIGITAL"
+
+# Whether each timeslot is advertised as IPSC-linked.
+# Peers use this to decide whether to attempt calls on each slot.
+# ts1_linked = true
+# ts2_linked = true
+
+# FLAGS byte 2 — application capability flags.
+# csbk    = false   # CSBK (control signalling) support
+# rpt_mon = false   # Repeater call monitoring
+# con_app = false   # 3rd-party console application (Motorola CPS / programming tool)
+
+# FLAGS byte 3 — XNL/XCMP and call flags (AUTH and MASTER are always set automatically).
+# xnl_con    = false   # XNL/XCMP connected (Motorola proprietary control protocol)
+# xnl_master = false   # XNL master device
+# xnl_slave  = false   # XNL slave device
+# data  = false   # Data calls supported
+# voice = true    # Voice calls supported
+
+# FLAGS byte 1 — service/capability flags.
+# All default false — only set these if you have a specific reason and a wire capture
+# to verify the effect.  Leave false for a standard repeater or bridge application.
+# mnis         = false   # MNIS (Mobile Network Interface Service) capable
+# ip_site_freq = false   # IP Site Single Frequency
+# slot1_phone  = false   # TS1 phone patch capable
+# slot2_phone  = false   # TS2 phone patch capable
+# virtual_peer = false   # Software/virtual peer — signals this is not a physical repeater.
+#                        # May affect how programming software and console apps interact with us.
+# cps_avail    = false   # CPS Available / FirmwareNet
+
+# FLAGS byte 0 — wireline/MNIS data service flags.
+# Only relevant for MNIS data service devices.  Leave all false for a standard
+# repeater or software application.
+# slot1_wireline = false   # TS1 wireline/MNIS capable
+# slot2_wireline = false   # TS2 wireline/MNIS capable
+# wireline_svc   = false   # Wireline data service active
+
+# IPSC version field (8 hex characters = 4 bytes).
+# Encodes two protocol type+version pairs: bytes 0-1 = main (type+version),
+# bytes 2-3 = backward-compatible (type+version).
+# Types: 0x01=IPSC, 0x02=CapacityPlus, 0x03=Application, 0x04=LinkedCapacityPlus
+# Default "04020401" = IPSC v2 main / IPSC v1 compat (from DMRlink).
+# Only change this if you have specific evidence from a wire capture.
+# ipsc_version = "04020401"
+
+[hbp]
+# Upstream HBP master to connect to (BrandMeister, DMR+, FreeDMR, HBlink4).
+master_ip   = "127.0.0.1"
+master_port = 62031
+
+# HBP repeater ID sent in all HBP packets.  Required — must be non-zero.
+# Typically the radio ID of the primary repeater, or a unique ID for this system.
+hbp_repeater_id = 3120000
+
+# Passphrase for the HBP master (must match the master's configuration).
+passphrase = "passw0rd"
+
+# HBP connection mode:
+# "TRACKING":   Connect HBP only while an IPSC peer is registered.
+#               Disconnect when the repeater goes away. Recommended.
+# "PERSISTENT": Keep the HBP connection up regardless of repeater state.
+#               Useful to keep the system visible on network dashboards.
+#               Requires hbp_repeater_id to be non-zero — the HBP connection
+#               is established at startup, before any repeater registers.
+hbp_mode = "TRACKING"
+
+# ---------------------------------------------------------------------------
+# Options string — sent as RPTO after RPTC if non-empty.
+# Used to subscribe to specific TGIDs on HBlink4 and compatible servers.
+# Format: "TS1=tgid,tgid,...;TS2=tgid,tgid,..."
+# Use "*" for all TGIDs on a slot.  Leave empty to skip the RPTO step.
+# Examples:
+#   options = "TS1=91,310;TS2=*"
+#   options = ""
+# ---------------------------------------------------------------------------
+options = ""
+
+# ---------------------------------------------------------------------------
+# RPTC announcement fields — sent to the HBP master during handshake.
+# BrandMeister validates field widths strictly; fill these accurately.
+# ---------------------------------------------------------------------------
+callsign    = "W1ABC"
+rx_freq     = "444000000"   # Hz, 9 ASCII digits
+tx_freq     = "449000000"   # Hz, 9 ASCII digits
+tx_power    = "25"          # Watts, up to 2 digits
+colorcode   = "1"           # DMR colour code (1–15)
+latitude    = "38.8500"     # decimal degrees, up to 8 characters
+longitude   = "-097.6114"   # decimal degrees, up to 9 characters
+height      = "10"          # antenna height above ground, metres, up to 3 digits
+location    = "Smalltown KS"
+description = "IPSC-HBP Bridge"
+url         = ""
+software_id = "ipsc2hbp"
+package_id  = "duplex"

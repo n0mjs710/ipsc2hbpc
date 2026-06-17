@@ -1,0 +1,26 @@
+# ipsc2hbpc.service — systemd unit for the C implementation.
+# Installed by `sudo make install` to /lib/systemd/system/ipsc2hbpc.service.
+#
+# NOTE: Conflicts= ensures systemd will not run this alongside the original
+# Python ipsc2hbp.service.  Stop and disable that unit before enabling this one.
+
+[Unit]
+Description=IPSC to HomeBrew Protocol bridge (C)
+Documentation=https://github.com/n0mjs710/ipsc2hbpc
+After=network.target
+Wants=network.target
+Conflicts=ipsc2hbp.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/ipsc2hbpc -c /etc/ipsc2hbp/ipsc2hbp.toml
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ipsc2hbpc
+
+[Install]
+WantedBy=multi-user.target

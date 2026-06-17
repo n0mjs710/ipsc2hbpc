@@ -1,0 +1,22 @@
+# Live configuration — never commit; copy ipsc2hbp.toml.sample to get started
+ipsc2hbp.toml
+
+# Build artifacts
+*.o
+*.a
+/ipsc2hbpc
+
+# Wire captures
+wire.txt
+*.wire
+
+# Claude Code session files
+.claude/
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

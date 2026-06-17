@@ -1,0 +1,19 @@
+# Config fixture for the byte-for-byte parity test (mirrors the Python tests/test.toml
+# fields that affect translator output: hbp_repeater_id and ipsc_master_id).
+[global]
+log_level = "WARNING"
+[ipsc]
+mode = "MASTER"
+bind_ip = "127.0.0.1"
+bind_port = 50000
+ipsc_master_id = 9999999
+auth_enabled = false
+keepalive_watchdog = 60
+[ipsc.capabilities]
+use_safe_defaults = true
+[hbp]
+master_ip = "127.0.0.1"
+master_port = 62031
+hbp_repeater_id = 3120000
+passphrase = "passw0rd"
+hbp_mode = "PERSISTENT"
