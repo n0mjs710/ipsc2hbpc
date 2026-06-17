@@ -570,6 +570,7 @@ void translator_hbp_voice_received(translator *tr, const uint8_t *dmrd, int len)
                        "VOICE_TERM, clearing stale state",
                  ts, log_hex(tr->in_hbp_stream[ts], 4), log_hex(hbp_stream, 4));
             cancel_delivery_timer(tr, ts);
+            memset(tr->in_buf_present[ts], 0, sizeof tr->in_buf_present[ts]);
             tr->in_has_lc[ts]=0; tr->in_has_emb[ts]=0; tr->in_has_hbp_stream[ts]=0;
             tr->in_next_slot_time[ts]=0.0; tr->in_burst_pos[ts]=0; tr->in_consec_synth[ts]=0;
         }
