@@ -22,6 +22,7 @@ The Python `ipsc2hbp` is a single asyncio process — already simple and effecti
 - **Correct over clever.** Protocol behavior is derived from the DMRlink and HBlink source — not the published specs, which contain several errors. Where the spec disagrees with working code, the code wins.
 - **No external dependencies.** Everything — the TOML parser, SHA-1/SHA-256/HMAC, and the DMR DSP/FEC code — is in this repository and compiled into the binary.
 - **TRACKING mode by default.** The HBP connection follows the repeater: it comes up when the repeater registers and drops when the repeater goes away. PERSISTENT mode is available if you'd rather keep the upstream connection up regardless.
+- **Native call timing on the IPSC side.** The whole HBP→IPSC call (headers, voice, terminator) is clocked out through one jitter buffer at the exact 60 ms DMR cadence, so the repeater sees a continuous grid identical to real MOTOTRBO equipment — no header→voice gap and no clipped tail. Depth is tunable per link via `[hbp] jitter_buffer_depth` (default 2 = 120 ms; raise it for marginal/high-latency RF backhaul).
 
 **ARCHITECTURE:**
 

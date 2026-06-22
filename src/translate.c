@@ -13,7 +13,6 @@
 
 #define LOGN "translate.translator"
 
-#define JITTER_BUFFER_DEPTH 2     /* slots × 60 ms */
 #define MAX_SYNTH_BURSTS    6
 #define SLOT_MS             0.060
 
@@ -63,6 +62,10 @@ struct translator {
     double   in_last_pkt[3];
     int      in_buf_present[3][6];
     uint8_t  in_buf[3][6][19];
+    uint8_t  in_head_lc[3][8][9];     /* pending VOICE_HEAD LCs (pre-roll FIFO) */
+    int      in_head_n[3];            /* number of queued headers */
+    int      in_term_pending[3];      /* terminator received; emit after tail drains */
+    int      in_voice_started[3];     /* first voice burst delivered yet (anchors pos) */
     double   in_next_slot_time[3];
     int      in_burst_pos[3];
     int      in_consec_synth[3];
@@ -241,6 +244,9 @@ static void init_call_state(translator *tr)
     memset(tr->in_has_hbp_stream, 0, sizeof tr->in_has_hbp_stream);
     tr->in_last_pkt[1]=tr->in_last_pkt[2]=0.0;
     memset(tr->in_buf_present, 0, sizeof tr->in_buf_present);
+    tr->in_head_n[1]=tr->in_head_n[2]=0;
+    tr->in_term_pending[1]=tr->in_term_pending[2]=0;
+    tr->in_voice_started[1]=tr->in_voice_started[2]=0;
     tr->in_next_slot_time[1]=tr->in_next_slot_time[2]=0.0;
     tr->in_burst_pos[1]=tr->in_burst_pos[2]=0;
     tr->in_consec_synth[1]=tr->in_consec_synth[2]=0;
@@ -512,8 +518,93 @@ static int build_slot_voice_payload(translator *tr, int ts, int pos, const uint8
 
 static void on_stream_timeout(translator *tr, int ts);
 
+/* Start the delivery clock if idle, anchored cfg->jitter_buffer_depth slots out.
+ * The whole call (headers, voice, terminator) is clocked from this single anchor
+ * so the source's own header→voice spacing is preserved rather than inflated. */
+static void ensure_clock(translator *tr, int ts)
+{
+    if (tr->in_delivery_timer[ts] == NULL && tr->in_next_slot_time[ts] == 0.0) {
+        tr->in_consec_synth[ts] = 0;
+        tr->in_next_slot_time[ts] = ev_now(tr->loop) + tr->cfg->jitter_buffer_depth * SLOT_MS;
+        arm_delivery(tr, ts);
+    }
+}
+
+static void advance_clock(translator *tr, int ts)
+{
+    tr->in_next_slot_time[ts] += SLOT_MS;
+    arm_delivery(tr, ts);
+}
+
+static void clear_in_call(translator *tr, int ts)
+{
+    cancel_delivery_timer(tr, ts);
+    memset(tr->in_buf_present[ts], 0, sizeof tr->in_buf_present[ts]);
+    tr->in_head_n[ts] = 0;
+    tr->in_term_pending[ts] = 0;
+    tr->in_voice_started[ts] = 0;
+    tr->in_next_slot_time[ts] = 0.0;
+    tr->in_burst_pos[ts] = 0;
+    tr->in_consec_synth[ts] = 0;
+    tr->in_has_hbp_stream[ts] = 0;
+    tr->in_has_lc[ts] = 0;
+    tr->in_has_emb[ts] = 0;
+}
+
+/* Build and send one inbound GROUP_VOICE frame; advance RTP counters. */
+static void emit_in(translator *tr, int ts, const uint8_t *lc, int call_info,
+                    int rtp_pt, const uint8_t *gv_payload, int gv_len, int advance_ts)
+{
+    if (advance_ts) tr->in_rtp_ts[ts] = (tr->in_rtp_ts[ts] + 480) & 0xFFFFFFFF;
+    uint8_t rtp_hdr[12] = {0x80, (uint8_t)rtp_pt};
+    rtp_hdr[2]=(uint8_t)(tr->in_rtp_seq[ts]>>8); rtp_hdr[3]=(uint8_t)(tr->in_rtp_seq[ts]&0xFF);
+    rtp_hdr[4]=(uint8_t)(tr->in_rtp_ts[ts]>>24); rtp_hdr[5]=(uint8_t)(tr->in_rtp_ts[ts]>>16);
+    rtp_hdr[6]=(uint8_t)(tr->in_rtp_ts[ts]>>8); rtp_hdr[7]=(uint8_t)(tr->in_rtp_ts[ts]);
+    tr->in_rtp_seq[ts]++;
+    uint8_t gv[128];
+    int n = build_gv(tr, lc + 6, lc + 3, call_info, rtp_hdr, gv_payload, gv_len,
+                     tr->in_stream_id[ts], gv);
+    ipsc_send_voice(tr->ip, gv, n);
+}
+
+static void emit_term(translator *tr, int ts)
+{
+    const uint8_t *lc = tr->in_lc[ts];
+    int call_info = ((ts == 2) ? TS_CALL_MSK : 0x00) | END_MSK;
+    uint8_t gv_payload[24]; gv_payload[0]=VOICE_TERM;
+    build_ipsc_voice_payload(lc, VOICE_TERM, gv_payload+1);
+    emit_in(tr, ts, lc, call_info, 0x5e, gv_payload, 24, 0);
+    LOGI(LOGN, "HBP call end:   src=%u  tg=%u  ts=%d  ipsc_id=0x%02x",
+         (unsigned)(lc[6]<<16|lc[7]<<8|lc[8]),
+         (unsigned)(lc[3]<<16|lc[4]<<8|lc[5]), ts, tr->in_stream_id[ts]);
+    clear_in_call(tr, ts);
+}
+
+static int in_buf_empty(translator *tr, int ts)
+{
+    for (int i = 0; i < 6; i++) if (tr->in_buf_present[ts][i]) return 0;
+    return 1;
+}
+
 static void deliver_slot(translator *tr, int ts)
 {
+    int call_info = (ts == 2) ? TS_CALL_MSK : 0x00;
+
+    /* 1) Header pre-roll — emit one queued VOICE_HEAD this slot. */
+    if (tr->in_head_n[ts] > 0) {
+        uint8_t lc[9];
+        memcpy(lc, tr->in_head_lc[ts][0], 9);
+        for (int i = 1; i < tr->in_head_n[ts]; i++)
+            memcpy(tr->in_head_lc[ts][i-1], tr->in_head_lc[ts][i], 9);
+        tr->in_head_n[ts]--;
+        uint8_t gv_payload[24]; gv_payload[0]=VOICE_HEAD;
+        build_ipsc_voice_payload(lc, VOICE_HEAD, gv_payload+1);
+        emit_in(tr, ts, lc, call_info, 0xdd, gv_payload, 24, 0);
+        advance_clock(tr, ts);
+        return;
+    }
+
+    /* 2) Voice delivery (position-indexed; silence fills jitter gaps). */
     int pos = tr->in_burst_pos[ts];
     const uint8_t *ambe_19;
     if (tr->in_buf_present[ts][pos]) {
@@ -521,56 +612,32 @@ static void deliver_slot(translator *tr, int ts)
         tr->in_buf_present[ts][pos] = 0;
         tr->in_consec_synth[ts] = 0;
     } else {
+        if (tr->in_term_pending[ts] && in_buf_empty(tr, ts)) {
+            /* Tail fully drained — emit the terminator and end the call. */
+            emit_term(tr, ts);
+            return;
+        }
         ambe_19 = tr->ambe_silence;
-        tr->in_consec_synth[ts]++;
-        LOGD(LOGN, "^ SYNTH  ts=%d  %c  consec=%d", ts, "ABCDEF"[pos], tr->in_consec_synth[ts]);
-        if (tr->in_consec_synth[ts] >= MAX_SYNTH_BURSTS) { on_stream_timeout(tr, ts); return; }
+        if (!tr->in_term_pending[ts]) {
+            tr->in_consec_synth[ts]++;
+            LOGD(LOGN, "^ SYNTH  ts=%d  %c  consec=%d", ts, "ABCDEF"[pos], tr->in_consec_synth[ts]);
+            if (tr->in_consec_synth[ts] >= MAX_SYNTH_BURSTS) { on_stream_timeout(tr, ts); return; }
+        }
     }
 
-    const uint8_t *lc = tr->in_lc[ts];
-    int call_info = (ts == 2) ? TS_CALL_MSK : 0x00;
-    const uint8_t *dst = lc + 3, *src = lc + 6;
-
+    tr->in_voice_started[ts] = 1;
     uint8_t gv_payload[64];
     int gv_len = build_slot_voice_payload(tr, ts, pos, ambe_19, gv_payload);
-
-    tr->in_rtp_ts[ts] = (tr->in_rtp_ts[ts] + 480) & 0xFFFFFFFF;
-    uint8_t rtp_hdr[12] = {0x80, 0x5d};
-    rtp_hdr[2]=(uint8_t)(tr->in_rtp_seq[ts]>>8); rtp_hdr[3]=(uint8_t)(tr->in_rtp_seq[ts]&0xFF);
-    rtp_hdr[4]=(uint8_t)(tr->in_rtp_ts[ts]>>24); rtp_hdr[5]=(uint8_t)(tr->in_rtp_ts[ts]>>16);
-    rtp_hdr[6]=(uint8_t)(tr->in_rtp_ts[ts]>>8); rtp_hdr[7]=(uint8_t)(tr->in_rtp_ts[ts]);
-    tr->in_rtp_seq[ts]++;
-
-    uint8_t gv[128];
-    int n = build_gv(tr, src, dst, call_info, rtp_hdr, gv_payload, gv_len, tr->in_stream_id[ts], gv);
-    ipsc_send_voice(tr->ip, gv, n);
-
+    emit_in(tr, ts, tr->in_lc[ts], call_info, 0x5d, gv_payload, gv_len, 1);
     tr->in_burst_pos[ts] = (pos + 1) % 6;
-    tr->in_next_slot_time[ts] += SLOT_MS;
-    arm_delivery(tr, ts);
+    advance_clock(tr, ts);
 }
 
 static void on_stream_timeout(translator *tr, int ts)
 {
     LOGW(LOGN, "HBP->IPSC stream timeout ts=%d: %d consecutive silence bursts — synthesizing VOICE_TERM",
          ts, MAX_SYNTH_BURSTS);
-    const uint8_t *lc = tr->in_lc[ts];
-    int call_info = ((ts == 2) ? TS_CALL_MSK : 0x00) | END_MSK;
-    const uint8_t *dst = lc + 3, *src = lc + 6;
-    uint8_t gv_payload[24]; gv_payload[0]=VOICE_TERM;
-    build_ipsc_voice_payload(lc, VOICE_TERM, gv_payload+1);
-    uint8_t rtp_hdr[12] = {0x80, 0x5e};
-    rtp_hdr[2]=(uint8_t)(tr->in_rtp_seq[ts]>>8); rtp_hdr[3]=(uint8_t)(tr->in_rtp_seq[ts]&0xFF);
-    rtp_hdr[4]=(uint8_t)(tr->in_rtp_ts[ts]>>24); rtp_hdr[5]=(uint8_t)(tr->in_rtp_ts[ts]>>16);
-    rtp_hdr[6]=(uint8_t)(tr->in_rtp_ts[ts]>>8); rtp_hdr[7]=(uint8_t)(tr->in_rtp_ts[ts]);
-    tr->in_rtp_seq[ts]++;
-    uint8_t gv[128];
-    int n = build_gv(tr, src, dst, call_info, rtp_hdr, gv_payload, 24, tr->in_stream_id[ts], gv);
-    ipsc_send_voice(tr->ip, gv, n);
-    memset(tr->in_buf_present[ts], 0, sizeof tr->in_buf_present[ts]);
-    tr->in_next_slot_time[ts]=0.0; tr->in_burst_pos[ts]=0; tr->in_consec_synth[ts]=0;
-    tr->in_delivery_timer[ts]=NULL;
-    tr->in_has_hbp_stream[ts]=0; tr->in_has_lc[ts]=0; tr->in_has_emb[ts]=0;
+    emit_term(tr, ts);
 }
 
 void translator_hbp_voice_received(translator *tr, const uint8_t *dmrd, int len)
@@ -588,106 +655,93 @@ void translator_hbp_voice_received(translator *tr, const uint8_t *dmrd, int len)
     tr->in_last_pkt[ts] = ev_now(tr->loop);
     int frame_type = flags & HBPF_FRAMETYPE_MASK;
     int dtype = flags & HBPF_DTYPE_MASK;
-    int call_info = (ts == 2) ? TS_CALL_MSK : 0x00;
-
-    int rtp_pt = 0;
-    uint8_t gv_payload[24];
-    int do_send = 0;
-
     if (frame_type == HBPF_FRAMETYPE_DATASYNC && dtype == HBPF_SLT_VHEAD) {
         dmr_bit fb[264]; dmr_bytes_to_bits(payload_33, 33, fb);
         dmr_bit bptc_bits[196];
         memcpy(bptc_bits, fb, 98);
         memcpy(bptc_bits + 98, fb + 166, 98);
         uint8_t lc[9]; dmr_bptc_decode_full_lc(bptc_bits, lc);
-        memcpy(tr->in_lc[ts], lc, 9); tr->in_has_lc[ts]=1;
-        dmr_encode_emblc(lc, tr->in_emb[ts]); tr->in_has_emb[ts]=1;
-        if (tr->in_has_hbp_stream[ts] && memcmp(hbp_stream, tr->in_hbp_stream[ts], 4) == 0) {
-            LOGD(LOGN, "Duplicate VOICE_HEAD ts=%d stream=%s — forwarding, reusing stream_id=0x%02x",
-                 ts, log_hex(hbp_stream, 4), tr->in_stream_id[ts]);
-        } else {
+        if (!(tr->in_has_hbp_stream[ts] && memcmp(hbp_stream, tr->in_hbp_stream[ts], 4) == 0)) {
+            /* New call — clear leftover delivery state and assign a fresh stream
+             * ID.  The header is NOT sent now; it is queued and clocked out (with
+             * voice and the terminator) so the source's header->voice spacing is
+             * preserved instead of inflated. */
+            clear_in_call(tr, ts);
+            tr->in_rtp_seq[ts] = 0; tr->in_rtp_ts[ts] = 0;
             memcpy(tr->in_hbp_stream[ts], hbp_stream, 4); tr->in_has_hbp_stream[ts]=1;
             tr->in_stream_ctr = (tr->in_stream_ctr + 1) & 0xFF;
             tr->in_stream_id[ts] = tr->in_stream_ctr;
-            cancel_delivery_timer(tr, ts);
-            memset(tr->in_buf_present[ts], 0, sizeof tr->in_buf_present[ts]);
-            tr->in_burst_pos[ts]=0; tr->in_consec_synth[ts]=0; tr->in_next_slot_time[ts]=0.0;
             LOGI(LOGN, "HBP call start: src=%u  tg=%u  ts=%d  stream=%s  ipsc_id=0x%02x",
                  (unsigned)(src_sub[0]<<16|src_sub[1]<<8|src_sub[2]),
                  (unsigned)(dst_group[0]<<16|dst_group[1]<<8|dst_group[2]),
                  ts, log_hex(hbp_stream, 4), tr->in_stream_id[ts]);
+        } else {
+            /* Duplicate VOICE_HEAD — Motorola radios send 2-3 for loss
+             * resilience.  Relay each one faithfully (queue it); never fabricate. */
+            LOGD(LOGN, "Duplicate VOICE_HEAD ts=%d stream=%s — relaying, stream_id=0x%02x",
+                 ts, log_hex(hbp_stream, 4), tr->in_stream_id[ts]);
         }
-        gv_payload[0]=VOICE_HEAD; build_ipsc_voice_payload(lc, VOICE_HEAD, gv_payload+1);
-        rtp_pt = 0xdd; do_send = 1;
-    } else if (frame_type == HBPF_FRAMETYPE_DATASYNC && dtype == HBPF_SLT_VTERM) {
-        uint8_t lc[9];
-        if (tr->in_has_lc[ts]) memcpy(lc, tr->in_lc[ts], 9);
-        else { memcpy(lc, DMR_LC_OPT, 3); memcpy(lc+3, dst_group, 3); memcpy(lc+6, src_sub, 3); }
-        call_info |= END_MSK;
-        cancel_delivery_timer(tr, ts);
-        memset(tr->in_buf_present[ts], 0, sizeof tr->in_buf_present[ts]);
-        tr->in_next_slot_time[ts]=0.0; tr->in_burst_pos[ts]=0; tr->in_consec_synth[ts]=0;
-        gv_payload[0]=VOICE_TERM; build_ipsc_voice_payload(lc, VOICE_TERM, gv_payload+1);
-        rtp_pt = 0x5e; do_send = 1;
-    } else {
-        /* VOICESYNC (burst A) or VOICE (B-F) */
-        if (tr->in_has_lc[ts] && tr->in_has_hbp_stream[ts] &&
-            memcmp(tr->in_hbp_stream[ts], hbp_stream, 4) != 0) {
-            LOGW(LOGN, "HBP stream ID changed on ts=%d (%s->%s) — prior call ended without "
-                       "VOICE_TERM, clearing stale state",
-                 ts, log_hex(tr->in_hbp_stream[ts], 4), log_hex(hbp_stream, 4));
-            cancel_delivery_timer(tr, ts);
-            memset(tr->in_buf_present[ts], 0, sizeof tr->in_buf_present[ts]);
-            tr->in_has_lc[ts]=0; tr->in_has_emb[ts]=0; tr->in_has_hbp_stream[ts]=0;
-            tr->in_next_slot_time[ts]=0.0; tr->in_burst_pos[ts]=0; tr->in_consec_synth[ts]=0;
+        memcpy(tr->in_lc[ts], lc, 9); tr->in_has_lc[ts]=1;
+        dmr_encode_emblc(lc, tr->in_emb[ts]); tr->in_has_emb[ts]=1;
+        if (tr->in_head_n[ts] < 8) {
+            memcpy(tr->in_head_lc[ts][tr->in_head_n[ts]], lc, 9);
+            tr->in_head_n[ts]++;
         }
-        if (!tr->in_has_lc[ts]) {
-            uint8_t lc[9]; memcpy(lc, DMR_LC_OPT, 3); memcpy(lc+3, dst_group, 3); memcpy(lc+6, src_sub, 3);
-            memcpy(tr->in_lc[ts], lc, 9); tr->in_has_lc[ts]=1;
-            dmr_encode_emblc(lc, tr->in_emb[ts]); tr->in_has_emb[ts]=1;
-            memcpy(tr->in_hbp_stream[ts], hbp_stream, 4); tr->in_has_hbp_stream[ts]=1;
-            tr->in_stream_ctr = (tr->in_stream_ctr + 1) & 0xFF;
-            tr->in_stream_id[ts] = tr->in_stream_ctr;
-            LOGI(LOGN, "HBP late entry: ts=%d src=%u tg=%u — LC from stream, hbp_stream=%s",
-                 ts, (unsigned)(src_sub[0]<<16|src_sub[1]<<8|src_sub[2]),
-                 (unsigned)(dst_group[0]<<16|dst_group[1]<<8|dst_group[2]), log_hex(hbp_stream, 4));
-        }
-        int cur_pos;
-        if (frame_type == HBPF_FRAMETYPE_VOICESYNC) cur_pos = 0;
-        else if (dtype == 4) cur_pos = 4;
-        else if (dtype >= 5) cur_pos = 5;
-        else cur_pos = dtype < 1 ? 1 : dtype;   /* max(dtype,1) */
-
-        extract_ambe_from_dmrd(payload_33, tr->in_buf[ts][cur_pos]);
-        tr->in_buf_present[ts][cur_pos] = 1;
-
-        if (tr->in_delivery_timer[ts] == NULL && tr->in_next_slot_time[ts] == 0.0) {
-            tr->in_burst_pos[ts] = cur_pos;
-            tr->in_consec_synth[ts] = 0;
-            tr->in_next_slot_time[ts] = ev_now(tr->loop) + JITTER_BUFFER_DEPTH * SLOT_MS;
-            arm_delivery(tr, ts);
-        }
+        ensure_clock(tr, ts);
         return;
     }
 
-    if (do_send) {
-        uint8_t rtp_hdr[12] = {0x80, (uint8_t)rtp_pt};
-        rtp_hdr[2]=(uint8_t)(tr->in_rtp_seq[ts]>>8); rtp_hdr[3]=(uint8_t)(tr->in_rtp_seq[ts]&0xFF);
-        rtp_hdr[4]=(uint8_t)(tr->in_rtp_ts[ts]>>24); rtp_hdr[5]=(uint8_t)(tr->in_rtp_ts[ts]>>16);
-        rtp_hdr[6]=(uint8_t)(tr->in_rtp_ts[ts]>>8); rtp_hdr[7]=(uint8_t)(tr->in_rtp_ts[ts]);
-        tr->in_rtp_seq[ts]++;
-        uint8_t gv[128];
-        int n = build_gv(tr, src_sub, dst_group, call_info, rtp_hdr, gv_payload, 24, tr->in_stream_id[ts], gv);
-        ipsc_send_voice(tr->ip, gv, n);
-
-        if (frame_type == HBPF_FRAMETYPE_DATASYNC && dtype == HBPF_SLT_VTERM) {
-            LOGI(LOGN, "HBP call end:   src=%u  tg=%u  ts=%d  stream=%s  ipsc_id=0x%02x",
-                 (unsigned)(src_sub[0]<<16|src_sub[1]<<8|src_sub[2]),
-                 (unsigned)(dst_group[0]<<16|dst_group[1]<<8|dst_group[2]),
-                 ts, log_hex(hbp_stream, 4), tr->in_stream_id[ts]);
-            tr->in_has_lc[ts]=0; tr->in_has_emb[ts]=0; tr->in_has_hbp_stream[ts]=0;
+    if (frame_type == HBPF_FRAMETYPE_DATASYNC && dtype == HBPF_SLT_VTERM) {
+        if (!tr->in_has_lc[ts]) {
+            /* Terminator with no active call — build a fallback LC so we can
+             * still relay a clean call end. */
+            uint8_t lc[9]; memcpy(lc, DMR_LC_OPT, 3); memcpy(lc+3, dst_group, 3); memcpy(lc+6, src_sub, 3);
+            memcpy(tr->in_lc[ts], lc, 9); tr->in_has_lc[ts]=1;
+            dmr_encode_emblc(lc, tr->in_emb[ts]); tr->in_has_emb[ts]=1;
+            if (!tr->in_has_hbp_stream[ts]) {
+                memcpy(tr->in_hbp_stream[ts], hbp_stream, 4); tr->in_has_hbp_stream[ts]=1;
+            }
         }
+        /* Mark pending; the clock emits it once the buffered voice tail drains,
+         * so we stop clipping the end of the call. */
+        tr->in_term_pending[ts] = 1;
+        ensure_clock(tr, ts);
+        return;
     }
+
+    /* VOICESYNC (burst A) or VOICE (B-F) */
+    if (tr->in_has_lc[ts] && tr->in_has_hbp_stream[ts] &&
+        memcmp(tr->in_hbp_stream[ts], hbp_stream, 4) != 0) {
+        LOGW(LOGN, "HBP stream ID changed on ts=%d (%s->%s) — prior call ended without "
+                   "VOICE_TERM, clearing stale state",
+             ts, log_hex(tr->in_hbp_stream[ts], 4), log_hex(hbp_stream, 4));
+        clear_in_call(tr, ts);
+    }
+    if (!tr->in_has_lc[ts]) {
+        uint8_t lc[9]; memcpy(lc, DMR_LC_OPT, 3); memcpy(lc+3, dst_group, 3); memcpy(lc+6, src_sub, 3);
+        memcpy(tr->in_lc[ts], lc, 9); tr->in_has_lc[ts]=1;
+        dmr_encode_emblc(lc, tr->in_emb[ts]); tr->in_has_emb[ts]=1;
+        memcpy(tr->in_hbp_stream[ts], hbp_stream, 4); tr->in_has_hbp_stream[ts]=1;
+        tr->in_stream_ctr = (tr->in_stream_ctr + 1) & 0xFF;
+        tr->in_stream_id[ts] = tr->in_stream_ctr;
+        tr->in_rtp_seq[ts] = 0; tr->in_rtp_ts[ts] = 0;
+        LOGI(LOGN, "HBP late entry: ts=%d src=%u tg=%u — LC from stream, hbp_stream=%s",
+             ts, (unsigned)(src_sub[0]<<16|src_sub[1]<<8|src_sub[2]),
+             (unsigned)(dst_group[0]<<16|dst_group[1]<<8|dst_group[2]), log_hex(hbp_stream, 4));
+    }
+    int cur_pos;
+    if (frame_type == HBPF_FRAMETYPE_VOICESYNC) cur_pos = 0;
+    else if (dtype == 4) cur_pos = 4;
+    else if (dtype >= 5) cur_pos = 5;
+    else cur_pos = dtype < 1 ? 1 : dtype;   /* max(dtype,1) */
+
+    /* Anchor voice delivery to the position of the first buffered burst. */
+    if (!tr->in_voice_started[ts] && in_buf_empty(tr, ts))
+        tr->in_burst_pos[ts] = cur_pos;
+
+    extract_ambe_from_dmrd(payload_33, tr->in_buf[ts][cur_pos]);
+    tr->in_buf_present[ts][cur_pos] = 1;
+    ensure_clock(tr, ts);
 }
 
 void translator_check_call_timeouts(translator *tr)
@@ -713,10 +767,7 @@ void translator_check_call_timeouts(translator *tr)
             double el = now - tr->in_last_pkt[ts];
             if (el > timeout) {
                 LOGW(LOGN, "HBP->IPSC call timeout: ts=%d — no voice for %.1fs, clearing", ts, el);
-                cancel_delivery_timer(tr, ts);
-                memset(tr->in_buf_present[ts], 0, sizeof tr->in_buf_present[ts]);
-                tr->in_has_lc[ts]=0; tr->in_has_emb[ts]=0; tr->in_has_hbp_stream[ts]=0;
-                tr->in_next_slot_time[ts]=0.0; tr->in_burst_pos[ts]=0; tr->in_consec_synth[ts]=0;
+                clear_in_call(tr, ts);
             }
         }
     }

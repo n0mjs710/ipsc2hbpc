@@ -262,6 +262,7 @@ int config_load(const char *path, Config *cfg, char *err, size_t errlen)
     { static const char *HM[] = {"TRACKING","PERSISTENT"};
       get_choice(t, &e, "hbp", "hbp_mode", 1, "TRACKING", HM, 2, cfg->hbp_mode, sizeof cfg->hbp_mode); }
     cfg->hbp_repeater_id = (uint32_t)get_int(t, &e, "hbp", "hbp_repeater_id", 1, 0, 1, 1, 0, 0);
+    cfg->jitter_buffer_depth = (int)get_int(t, &e, "hbp", "jitter_buffer_depth", 0, 2, 1, 1, 1, 8);
 
     { char pp[256]; get_str(t, &e, "hbp", "passphrase", 1, "", pp, sizeof pp);
       cfg->hbp_passphrase_len = (int)strlen(pp);

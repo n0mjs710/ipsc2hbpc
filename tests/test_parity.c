@@ -33,6 +33,8 @@ void hbp_send_dmrd(struct hbp *hb, const uint8_t *d, int n) {
     if (ncap < MAXCAP) { memcpy(cap[ncap], d, (size_t)n); caplen[ncap] = n; ncap++; }
 }
 
+static void stop_cb(ev_loop *loop, void *ud){ (void)ud; ev_stop(loop); }
+
 static int hexv(char c){ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10; return -1; }
 static int unhex(const char *s, uint8_t *out){ int n=0; for(;s[0]&&s[1]&&hexv(s[0])>=0;s+=2) out[n++]=(uint8_t)((hexv(s[0])<<4)|hexv(s[1])); return n; }
 
@@ -90,6 +92,10 @@ int main(void)
             uint8_t raw[128]; int n = unhex(line, raw);
             translator_hbp_voice_received(tr, raw, n);
         }
+        /* HEAD/voice/TERM are now clocked out via the delivery timer; run the
+         * loop briefly so those timers fire and emit the GROUP_VOICE frames. */
+        ev_timer_after(loop, 0.4, stop_cb, loop);
+        ev_run(loop);
         int gidx = 0;
         while (fgets(line, sizeof line, fr)) {
             uint8_t ref[128]; int rn = unhex(line, ref);

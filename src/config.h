@@ -45,6 +45,7 @@ typedef struct {
     char     hbp_passphrase[256];
     int      hbp_passphrase_len;
     char     hbp_mode[16];          /* "TRACKING" | "PERSISTENT" */
+    int      jitter_buffer_depth;   /* HBP->IPSC delivery delay in 60 ms slots */
 
     /* RPTC announcement fields */
     char     options[512];
