@@ -62,10 +62,7 @@ struct translator {
     double   in_last_pkt[3];
     int      in_buf_present[3][6];
     uint8_t  in_buf[3][6][19];
-    uint8_t  in_head_lc[3][8][9];     /* pending VOICE_HEAD LCs (pre-roll FIFO) */
-    int      in_head_n[3];            /* number of queued headers */
     int      in_term_pending[3];      /* terminator received; emit after tail drains */
-    int      in_voice_started[3];     /* first voice burst delivered yet (anchors pos) */
     double   in_next_slot_time[3];
     int      in_burst_pos[3];
     int      in_consec_synth[3];
@@ -89,7 +86,8 @@ static void delivery_timer_cb(ev_loop *loop, void *ud)
     struct deliv_ctx *c = ud;
     translator *tr = c->tr; int ts = c->ts;
     tr->in_delivery_timer[ts] = NULL;
-    if (!tr->in_has_lc[ts] || !ipsc_has_peers(tr->ip)) return;
+    if (!ipsc_has_peers(tr->ip)) return;
+    if (!tr->in_has_lc[ts] && !tr->in_term_pending[ts]) return;
     deliver_slot(tr, ts);
 }
 
@@ -244,9 +242,7 @@ static void init_call_state(translator *tr)
     memset(tr->in_has_hbp_stream, 0, sizeof tr->in_has_hbp_stream);
     tr->in_last_pkt[1]=tr->in_last_pkt[2]=0.0;
     memset(tr->in_buf_present, 0, sizeof tr->in_buf_present);
-    tr->in_head_n[1]=tr->in_head_n[2]=0;
     tr->in_term_pending[1]=tr->in_term_pending[2]=0;
-    tr->in_voice_started[1]=tr->in_voice_started[2]=0;
     tr->in_next_slot_time[1]=tr->in_next_slot_time[2]=0.0;
     tr->in_burst_pos[1]=tr->in_burst_pos[2]=0;
     tr->in_consec_synth[1]=tr->in_consec_synth[2]=0;
@@ -518,12 +514,19 @@ static int build_slot_voice_payload(translator *tr, int ts, int pos, const uint8
 
 static void on_stream_timeout(translator *tr, int ts);
 
-/* Start the delivery clock if idle, anchored cfg->jitter_buffer_depth slots out.
- * The whole call (headers, voice, terminator) is clocked from this single anchor
- * so the source's own header→voice spacing is preserved rather than inflated. */
-static void ensure_clock(translator *tr, int ts)
+static int clock_idle(translator *tr, int ts)
 {
-    if (tr->in_delivery_timer[ts] == NULL && tr->in_next_slot_time[ts] == 0.0) {
+    return tr->in_delivery_timer[ts] == NULL && tr->in_next_slot_time[ts] == 0.0;
+}
+
+/* Anchor the delivery clock to the FIRST voice burst, with jitter_buffer_depth
+ * slots of lead.  The header→voice gap on the HBP wire (~175 ms) is wider than
+ * the buffer, so the clock is deliberately NOT anchored to the header — doing so
+ * would consume all the lead before voice arrives and starve the buffer. */
+static void arm_clock_from_voice(translator *tr, int ts, int first_pos)
+{
+    if (clock_idle(tr, ts)) {
+        tr->in_burst_pos[ts] = first_pos;
         tr->in_consec_synth[ts] = 0;
         tr->in_next_slot_time[ts] = ev_now(tr->loop) + tr->cfg->jitter_buffer_depth * SLOT_MS;
         arm_delivery(tr, ts);
@@ -540,9 +543,7 @@ static void clear_in_call(translator *tr, int ts)
 {
     cancel_delivery_timer(tr, ts);
     memset(tr->in_buf_present[ts], 0, sizeof tr->in_buf_present[ts]);
-    tr->in_head_n[ts] = 0;
     tr->in_term_pending[ts] = 0;
-    tr->in_voice_started[ts] = 0;
     tr->in_next_slot_time[ts] = 0.0;
     tr->in_burst_pos[ts] = 0;
     tr->in_consec_synth[ts] = 0;
@@ -590,21 +591,8 @@ static void deliver_slot(translator *tr, int ts)
 {
     int call_info = (ts == 2) ? TS_CALL_MSK : 0x00;
 
-    /* 1) Header pre-roll — emit one queued VOICE_HEAD this slot. */
-    if (tr->in_head_n[ts] > 0) {
-        uint8_t lc[9];
-        memcpy(lc, tr->in_head_lc[ts][0], 9);
-        for (int i = 1; i < tr->in_head_n[ts]; i++)
-            memcpy(tr->in_head_lc[ts][i-1], tr->in_head_lc[ts][i], 9);
-        tr->in_head_n[ts]--;
-        uint8_t gv_payload[24]; gv_payload[0]=VOICE_HEAD;
-        build_ipsc_voice_payload(lc, VOICE_HEAD, gv_payload+1);
-        emit_in(tr, ts, lc, call_info, 0xdd, gv_payload, 24, 0);
-        advance_clock(tr, ts);
-        return;
-    }
-
-    /* 2) Voice delivery (position-indexed; silence fills jitter gaps). */
+    /* Voice delivery (position-indexed; silence fills jitter gaps).  Headers are
+     * not clocked here — they are forwarded immediately on receive. */
     int pos = tr->in_burst_pos[ts];
     const uint8_t *ambe_19;
     if (tr->in_buf_present[ts][pos]) {
@@ -625,7 +613,6 @@ static void deliver_slot(translator *tr, int ts)
         }
     }
 
-    tr->in_voice_started[ts] = 1;
     uint8_t gv_payload[64];
     int gv_len = build_slot_voice_payload(tr, ts, pos, ambe_19, gv_payload);
     emit_in(tr, ts, tr->in_lc[ts], call_info, 0x5d, gv_payload, gv_len, 1);
@@ -663,9 +650,9 @@ void translator_hbp_voice_received(translator *tr, const uint8_t *dmrd, int len)
         uint8_t lc[9]; dmr_bptc_decode_full_lc(bptc_bits, lc);
         if (!(tr->in_has_hbp_stream[ts] && memcmp(hbp_stream, tr->in_hbp_stream[ts], 4) == 0)) {
             /* New call — clear leftover delivery state and assign a fresh stream
-             * ID.  The header is NOT sent now; it is queued and clocked out (with
-             * voice and the terminator) so the source's header->voice spacing is
-             * preserved instead of inflated. */
+             * ID.  Do NOT arm the delivery clock here: the header->voice gap on the
+             * HBP wire (~175 ms) is wider than the buffer, so the clock is armed
+             * from the first VOICE burst instead. */
             clear_in_call(tr, ts);
             tr->in_rtp_seq[ts] = 0; tr->in_rtp_ts[ts] = 0;
             memcpy(tr->in_hbp_stream[ts], hbp_stream, 4); tr->in_has_hbp_stream[ts]=1;
@@ -677,17 +664,20 @@ void translator_hbp_voice_received(translator *tr, const uint8_t *dmrd, int len)
                  ts, log_hex(hbp_stream, 4), tr->in_stream_id[ts]);
         } else {
             /* Duplicate VOICE_HEAD — Motorola radios send 2-3 for loss
-             * resilience.  Relay each one faithfully (queue it); never fabricate. */
-            LOGD(LOGN, "Duplicate VOICE_HEAD ts=%d stream=%s — relaying, stream_id=0x%02x",
+             * resilience.  Relay each one faithfully; never fabricate. */
+            LOGD(LOGN, "Duplicate VOICE_HEAD ts=%d stream=%s — forwarding, stream_id=0x%02x",
                  ts, log_hex(hbp_stream, 4), tr->in_stream_id[ts]);
         }
         memcpy(tr->in_lc[ts], lc, 9); tr->in_has_lc[ts]=1;
         dmr_encode_emblc(lc, tr->in_emb[ts]); tr->in_has_emb[ts]=1;
-        if (tr->in_head_n[ts] < 8) {
-            memcpy(tr->in_head_lc[ts][tr->in_head_n[ts]], lc, 9);
-            tr->in_head_n[ts]++;
+        /* Forward the header immediately — preserves the source's header spacing
+         * exactly and keeps the header out of the voice delivery clock. */
+        {
+            int call_info = (ts == 2) ? TS_CALL_MSK : 0x00;
+            uint8_t gv_payload[24]; gv_payload[0]=VOICE_HEAD;
+            build_ipsc_voice_payload(lc, VOICE_HEAD, gv_payload+1);
+            emit_in(tr, ts, lc, call_info, 0xdd, gv_payload, 24, 0);
         }
-        ensure_clock(tr, ts);
         return;
     }
 
@@ -702,10 +692,13 @@ void translator_hbp_voice_received(translator *tr, const uint8_t *dmrd, int len)
                 memcpy(tr->in_hbp_stream[ts], hbp_stream, 4); tr->in_has_hbp_stream[ts]=1;
             }
         }
-        /* Mark pending; the clock emits it once the buffered voice tail drains,
-         * so we stop clipping the end of the call. */
+        /* Mark pending so the call tail isn't clipped. */
         tr->in_term_pending[ts] = 1;
-        ensure_clock(tr, ts);
+        if (clock_idle(tr, ts)) {
+            /* No buffered voice tail to drain — emit the terminator now. */
+            emit_term(tr, ts);
+        }
+        /* else: the running delivery clock emits TERM after the tail drains. */
         return;
     }
 
@@ -735,13 +728,12 @@ void translator_hbp_voice_received(translator *tr, const uint8_t *dmrd, int len)
     else if (dtype >= 5) cur_pos = 5;
     else cur_pos = dtype < 1 ? 1 : dtype;   /* max(dtype,1) */
 
-    /* Anchor voice delivery to the position of the first buffered burst. */
-    if (!tr->in_voice_started[ts] && in_buf_empty(tr, ts))
-        tr->in_burst_pos[ts] = cur_pos;
-
     extract_ambe_from_dmrd(payload_33, tr->in_buf[ts][cur_pos]);
     tr->in_buf_present[ts][cur_pos] = 1;
-    ensure_clock(tr, ts);
+    /* Arm the delivery clock from the FIRST voice burst (idle → arm), giving voice
+     * the full jitter_buffer_depth slots of lead regardless of the header->voice
+     * gap.  cur_pos anchors the superframe phase. */
+    arm_clock_from_voice(tr, ts, cur_pos);
 }
 
 void translator_check_call_timeouts(translator *tr)
