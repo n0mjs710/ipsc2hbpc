@@ -14,6 +14,14 @@
 #define MAX_PEERS 14
 #define LOGN "ipsc.protocol"
 
+/* Per-timeslot source lock (peer/mesh mode): one call can be delivered from two
+ * sources at once (a c-Bridge or DMRgateway re-injecting it). Lock the timeslot
+ * to the first source; drop other sources while it is actively talking, and for
+ * a guard window after its last frame keep dropping mid-call bursts (the lagging
+ * duplicate's tail). A genuine new call opens with VOICE_HEAD and is let through. */
+#define VOICE_LOCK_TIMEOUT 0.5   /* seconds — active-call window */
+#define VOICE_DUP_GUARD    2.0   /* seconds — duplicate-tail guard after a call */
+
 enum { ST_IDLE, ST_REGISTERING, ST_REGISTERED, ST_ACTIVE };
 
 typedef struct {
@@ -22,6 +30,8 @@ typedef struct {
     int     port;
     uint8_t mode;
     double  last_ka;
+    int     connected;    /* peer/mesh mode: peer-to-peer handshake complete */
+    int     outstanding;  /* peer/mesh mode: unanswered PEER_ALIVE_REQ count */
     int     used;
 } peer_t;
 
@@ -45,6 +55,8 @@ struct ipsc {
     int       connected;
     int       missed;
     ev_timer *ka_timer;
+    /* peer mesh: ip->peers[] holds peers learned from the master's PEER_LIST_REPLY */
+    struct { uint8_t src[4]; double t; int set; } vlock[3];  /* per-TS source lock ([1],[2]) */
 };
 
 /* ---------------- auth + send ---------------- */
@@ -265,6 +277,30 @@ static void on_group_voice(ipsc *ip, const uint8_t *d, int len, const char *host
     else
         ts = (burst_type & 0x80) ? 2 : 1;
 
+    /* Per-timeslot source lock (peer/mesh mode only, see VOICE_LOCK_TIMEOUT).
+     * The first source to key a timeslot owns it; other sources are dropped
+     * while it is active, and their mid-call bursts are dropped for a guard
+     * window afterward (the lagging duplicate's tail). */
+    if (!ip->is_master && (ts == 1 || ts == 2)) {
+        const uint8_t *src = d + 1;   /* sending peer's radio id */
+        double now = ev_now(ip->loop);
+        if (ip->vlock[ts].set && memcmp(ip->vlock[ts].src, src, 4) != 0) {
+            double age = now - ip->vlock[ts].t;
+            if (age < VOICE_LOCK_TIMEOUT) {
+                LOGD(LOGN, "IPSC peer: duplicate voice on ts=%d from %s:%d — dropped", ts, host, port);
+                return;
+            }
+            if (burst_type != VOICE_HEAD && age < VOICE_DUP_GUARD) {
+                LOGD(LOGN, "IPSC peer: duplicate tail on ts=%d from %s:%d (%.2fs) — dropped",
+                     ts, host, port, age);
+                return;
+            }
+        }
+        memcpy(ip->vlock[ts].src, src, 4);
+        ip->vlock[ts].t = now;
+        ip->vlock[ts].set = 1;
+    }
+
     translator_ipsc_voice_received(ip->tr, d, len, ts, burst_type);
 }
 
@@ -339,6 +375,117 @@ static void peer_reg_reply(ipsc *ip, const uint8_t *d, int len, const char *host
     if (!ip->connected) { ip->connected = 1; translator_peer_joined(ip->tr); }
 }
 
+/* ---------------- peer mode: full-mesh peer-to-peer ---------------- */
+
+static uint32_t pid32(const uint8_t p[4])
+{
+    return (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<8 | p[3];
+}
+
+/* PEER_REG_REQ/REPLY = opcode + our_id(4) + version(4); PEER_ALIVE_* = opcode +
+ * our_id(4) + ts_flags(5). */
+static void peer_mesh_send(ipsc *ip, uint8_t opcode, int with_version, const char *host, int port)
+{
+    uint8_t pkt[16]; int p = 0;
+    pkt[p++] = opcode;
+    memcpy(pkt + p, ip->our_id, 4); p += 4;
+    if (with_version) { memcpy(pkt + p, ip->cfg->ipsc_version, 4); p += 4; }
+    else              { memcpy(pkt + p, ip->ts_flags, 5);        p += 5; }
+    ipsc_send(ip, pkt, p, host, port);
+}
+
+/* Parse PEER_LIST_REPLY into ip->peers[]: 0x93 + master_id(4) + len(2) + N*[id(4) ip(4) port(2) mode(1)]. */
+static void peer_process_list(ipsc *ip, const uint8_t *d, int len)
+{
+    if (len < 7) { LOGW(LOGN, "IPSC peer: PEER_LIST_REPLY too short (%d bytes)", len); return; }
+    int entries_len = (int)d[5] << 8 | d[6];
+    int end = 7 + entries_len; if (end > len) end = len;
+    uint8_t seen[MAX_PEERS][4]; int nseen = 0;
+
+    for (int off = 7; off + 11 <= end; off += 11) {
+        const uint8_t *e = d + off;
+        if (memcmp(e, ip->our_id, 4) == 0) continue;   /* never mesh with ourselves */
+        struct in_addr a; memcpy(&a.s_addr, e + 4, 4);
+        char ipstr[16]; inet_ntop(AF_INET, &a, ipstr, sizeof ipstr);
+        int pport = (int)e[8] << 8 | e[9];
+        int idx = find_peer(ip, e);
+        if (idx < 0) {
+            for (int i = 0; i < MAX_PEERS; i++) if (!ip->peers[i].used) { idx = i; break; }
+            if (idx < 0) continue;                      /* table full */
+            memset(&ip->peers[idx], 0, sizeof ip->peers[idx]);
+            memcpy(ip->peers[idx].pid, e, 4);
+            ip->peers[idx].used = 1;
+            LOGI(LOGN, "IPSC peer: learned mesh peer %u at %s:%d", pid32(e), ipstr, pport);
+        }
+        snprintf(ip->peers[idx].ip, sizeof ip->peers[idx].ip, "%s", ipstr);
+        ip->peers[idx].port = pport;
+        ip->peers[idx].mode = e[10];
+        if (nseen < MAX_PEERS) memcpy(seen[nseen++], e, 4);
+    }
+    /* drop peers no longer listed */
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (!ip->peers[i].used) continue;
+        int found = 0;
+        for (int j = 0; j < nseen; j++) if (memcmp(seen[j], ip->peers[i].pid, 4) == 0) { found = 1; break; }
+        if (!found) {
+            LOGI(LOGN, "IPSC peer: mesh peer %u removed (not in peer list)", pid32(ip->peers[i].pid));
+            ip->peers[i].used = 0;
+        }
+    }
+    LOGD(LOGN, "IPSC peer: peer list processed — %d mesh peer(s)", peer_count(ip));
+}
+
+static void peer_on_reg_req(ipsc *ip, const uint8_t *d, const char *host, int port)
+{
+    peer_mesh_send(ip, PEER_REG_REPLY, 1, host, port);   /* confirm so the peer marks us CONNECTED */
+    int idx = find_peer(ip, d + 1);
+    if (idx >= 0) { snprintf(ip->peers[idx].ip, sizeof ip->peers[idx].ip, "%s", host); ip->peers[idx].port = port; }
+    LOGD(LOGN, "IPSC peer: PEER_REG_REQ from %u at %s:%d — replied", pid32(d + 1), host, port);
+}
+
+static void peer_on_reg_reply(ipsc *ip, const uint8_t *d)
+{
+    int idx = find_peer(ip, d + 1);
+    if (idx >= 0 && !ip->peers[idx].connected) {
+        ip->peers[idx].connected = 1; ip->peers[idx].outstanding = 0;
+        LOGI(LOGN, "IPSC peer: mesh peer %u CONNECTED (%s:%d)",
+             pid32(d + 1), ip->peers[idx].ip, ip->peers[idx].port);
+    }
+}
+
+static void peer_on_alive_req(ipsc *ip, const uint8_t *d, const char *host, int port)
+{
+    peer_mesh_send(ip, PEER_ALIVE_REPLY, 0, host, port);
+    int idx = find_peer(ip, d + 1);
+    if (idx >= 0) ip->peers[idx].outstanding = 0;
+}
+
+static void peer_on_alive_reply(ipsc *ip, const uint8_t *d)
+{
+    int idx = find_peer(ip, d + 1);
+    if (idx >= 0) ip->peers[idx].outstanding = 0;
+}
+
+/* Once per keepalive tick (peer mode): register with new peers, keepalive the
+ * connected ones, drop peers that stop answering. */
+static void peer_service_mesh(ipsc *ip)
+{
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (!ip->peers[i].used) continue;
+        if (!ip->peers[i].connected) {
+            peer_mesh_send(ip, PEER_REG_REQ, 1, ip->peers[i].ip, ip->peers[i].port);
+            LOGD(LOGN, "IPSC peer: PEER_REG_REQ -> %u (%s:%d)",
+                 pid32(ip->peers[i].pid), ip->peers[i].ip, ip->peers[i].port);
+        } else if (ip->peers[i].outstanding >= ip->cfg->keepalive_missed_max) {
+            LOGW(LOGN, "IPSC peer: mesh peer %u unresponsive — re-registering", pid32(ip->peers[i].pid));
+            ip->peers[i].connected = 0; ip->peers[i].outstanding = 0;
+        } else {
+            peer_mesh_send(ip, PEER_ALIVE_REQ, 0, ip->peers[i].ip, ip->peers[i].port);
+            ip->peers[i].outstanding++;
+        }
+    }
+}
+
 static void peer_keepalive_cb(ev_loop *loop, void *ud)
 {
     ipsc *ip = ud;
@@ -362,6 +509,11 @@ static void peer_keepalive_cb(ev_loop *loop, void *ud)
             ip->missed++;
         }
     }
+
+    /* Full mesh: once the master has given us the peer list, register with and
+     * keepalive every peer directly. */
+    if (ip->state == ST_ACTIVE) peer_service_mesh(ip);
+
     ip->ka_timer = ev_timer_after(loop, ip->cfg->keepalive_interval, peer_keepalive_cb, ip);
 }
 
@@ -375,11 +527,6 @@ static void recv_cb(ev_loop *loop, int fd, void *ud)
     char host[INET_ADDRSTRLEN]; int port = 0;
     int n = udp_recvfrom(fd, buf, sizeof buf, host, &port);
     if (n < 0) return;
-
-    if (!ip->is_master && strcmp(host, ip->cfg->ipsc_master_ip) != 0) {
-        LOGD(LOGN, "IPSC peer: packet from unexpected host %s — dropped", host);
-        return;
-    }
 
     if (ip->cfg->auth_enabled) {
         if (!check_auth(ip, buf, n)) {
@@ -424,26 +571,38 @@ static void recv_cb(ev_loop *loop, int fd, void *ud)
                      opcode, host, port, n, log_hex(buf, n));
         }
     } else {
+        /* IPSC is a full mesh: voice and the peer-to-peer handshake arrive
+         * directly from every peer we learned in PEER_LIST_REPLY, not just from
+         * the master. Accept from the master or any known peer; drop the rest. */
+        int from_master = !strcmp(host, ip->cfg->ipsc_master_ip);
+        int known = (n >= 5) && (find_peer(ip, buf + 1) >= 0);
+        if (!from_master && !known) {
+            LOGD(LOGN, "IPSC peer: 0x%02x from unknown source %s:%d — dropped", opcode, host, port);
+            return;
+        }
         switch (opcode) {
             case GROUP_VOICE:        on_group_voice(ip, buf, n, host, port, 1); break;
             case MASTER_REG_REPLY:   peer_reg_reply(ip, buf, n, host, port); break;
             case PEER_LIST_REPLY:    ip->missed = 0; ip->state = ST_ACTIVE;
-                                     LOGD(LOGN, "PEER_LIST_REPLY from master %s:%d  len=%d", host, port, n); break;
+                                     peer_process_list(ip, buf, n); break;
             case MASTER_ALIVE_REPLY: ip->missed = 0; LOGD(LOGN, "MASTER_ALIVE_REPLY from master %s:%d", host, port); break;
+            case PEER_REG_REQ:       peer_on_reg_req(ip, buf, host, port); break;
+            case PEER_REG_REPLY:     peer_on_reg_reply(ip, buf); break;
+            case PEER_ALIVE_REQ:     peer_on_alive_req(ip, buf, host, port); break;
+            case PEER_ALIVE_REPLY:   peer_on_alive_reply(ip, buf); break;
             case SYSTEM_MAP_REPLY:   LOGI(LOGN, "SYSTEM_MAP_REPLY (0x9D) from master %s:%d len=%d raw=%s",
                                           host, port, n, log_hex(buf, n)); break;
             case SYSTEM_MAP_REQ:     LOGI(LOGN, "SYSTEM_MAP_REQ (0x9C) from master %s:%d len=%d raw=%s",
                                           host, port, n, log_hex(buf, n)); break;
             case GROUP_DATA: case PVT_DATA:
-                LOGD(LOGN, "Data packet 0x%02x from master %s:%d — ignored", opcode, host, port); break;
+                LOGD(LOGN, "Data packet 0x%02x from %s:%d — ignored", opcode, host, port); break;
             case CALL_CONFIRMATION: case TXT_MESSAGE_ACK: case CALL_MON_STATUS: case CALL_MON_RPT:
             case REPEATER_BLOCKED: case PVT_VOICE: case RPT_WAKE_UP: case CALL_INTERRUPT_REQ:
-            case PEER_REG_REQ: case PEER_REG_REPLY: case PEER_ALIVE_REQ: case PEER_ALIVE_REPLY:
             case DE_REG_REPLY: case UNKNOWN_9E: case WIRELINE: case REMOTE_PROG_REQ:
             case REMOTE_PROG_REPLY: case OPCODE_0xF0:
-                LOGD(LOGN, "opcode 0x%02x from master %s:%d — received, not handled", opcode, host, port); break;
+                LOGD(LOGN, "opcode 0x%02x from %s:%d — received, not handled", opcode, host, port); break;
             default:
-                LOGW(LOGN, "unknown opcode 0x%02x from master %s:%d len=%d — no handler  raw=%s",
+                LOGW(LOGN, "unknown opcode 0x%02x from %s:%d len=%d — no handler  raw=%s",
                      opcode, host, port, n, log_hex(buf, n));
         }
     }
@@ -507,7 +666,14 @@ void ipsc_send_voice(ipsc *ip, const uint8_t *pkt, int len)
         for (int i = 0; i < MAX_PEERS; i++)
             if (ip->peers[i].used) ipsc_send(ip, pkt, len, ip->peers[i].ip, ip->peers[i].port);
     } else {
-        if (ip->connected) ipsc_send(ip, pkt, len, PMASTER(ip), PMPORT(ip));
+        /* Fan out to the whole mesh — master plus every connected peer (unicast
+         * emulation of multicast). Traffic we RECEIVE over IPSC is never sent
+         * back here: the source already flooded it to every peer directly. */
+        if (!ip->connected) return;
+        ipsc_send(ip, pkt, len, PMASTER(ip), PMPORT(ip));
+        for (int i = 0; i < MAX_PEERS; i++)
+            if (ip->peers[i].used && ip->peers[i].connected)
+                ipsc_send(ip, pkt, len, ip->peers[i].ip, ip->peers[i].port);
     }
 }
 

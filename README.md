@@ -8,7 +8,7 @@
 
 Two IPSC modes are supported:
 - **MASTER** (default) — ipsc2hbpc acts as the IPSC master; up to 14 MOTOTRBO repeaters register with it as peers.
-- **PEER** — ipsc2hbpc registers with an existing IPSC master (e.g. a repeater configured as master). All traffic on that IPSC system is forwarded to HBP.
+- **PEER** — ipsc2hbpc registers with an existing IPSC master (e.g. a repeater or c-Bridge configured as master) and joins the **full IPSC mesh**: it learns the other peers from the master's peer list, registers and keepalives with each of them directly (IPSC delivers voice peer-to-peer, not through the master), and forwards all traffic on that IPSC system to HBP. A per-timeslot source lock drops duplicate copies of a call (e.g. a c-Bridge/DMRgateway re-injecting it) so overlapping streams can't garble the audio.
 
 **WHY A C VERSION:**
 
