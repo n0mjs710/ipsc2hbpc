@@ -14,6 +14,7 @@
 #define KA_INTERVAL     5.0
 #define MAX_KA_AGE     15.0
 #define RECONNECT_DELAY 5.0
+#define LOGIN_TIMEOUT  15.0
 
 enum { ST_LOGIN, ST_AUTH_SENT, ST_CONFIG_SENT, ST_OPTIONS_SENT, ST_CONNECTED, ST_DISCONNECTED };
 
@@ -28,10 +29,31 @@ struct hbp {
     uint8_t            radio_id[4];
     ev_timer          *ping_timer;
     ev_timer          *reconnect_timer;
+    ev_timer          *login_timer;
 };
 
 static void hbp_connect(hbp *hb);
 static void disconnect(hbp *hb, int send_rptcl);
+
+/* Arm (or re-arm) the login-handshake watchdog.  Covers every pre-CONNECTED
+ * state: if the master goes away mid-handshake (or never answers the RPTL),
+ * this fires and drives a disconnect -> reconnect instead of wedging in
+ * ST_LOGIN forever. */
+static void login_timeout_cb(ev_loop *loop, void *ud)
+{
+    (void)loop;
+    hbp *hb = ud;
+    hb->login_timer = NULL;
+    LOGE(LOGN, "HBP: login handshake timed out (state %d, %.0fs) — reconnecting",
+         hb->state, LOGIN_TIMEOUT);
+    disconnect(hb, 0);
+}
+
+static void arm_login_timer(hbp *hb)
+{
+    if (hb->login_timer) ev_timer_cancel(hb->loop, hb->login_timer);
+    hb->login_timer = ev_timer_after(hb->loop, LOGIN_TIMEOUT, login_timeout_cb, hb);
+}
 
 /* ljust(n, '\0')[:n] */
 static void enc_field(uint8_t *dst, int n, const char *s)
@@ -88,12 +110,14 @@ static void on_rptack(hbp *hb, const uint8_t *d, int len)
         memcpy(pkt + 8, digest, 32);
         send_raw(hb, pkt, 40);
         hb->state = ST_AUTH_SENT;
+        arm_login_timer(hb);
         LOGI(LOGN, "HBP: <- RPTACK+salt  -> RPTK");
     } else if (hb->state == ST_AUTH_SENT) {
         uint8_t rptc[RPTC_LEN];
         int n = build_rptc(hb, rptc);
         send_raw(hb, rptc, n);
         hb->state = ST_CONFIG_SENT;
+        arm_login_timer(hb);
         LOGI(LOGN, "HBP: <- RPTACK(auth)  -> RPTC (%d bytes)", n);
     } else if (hb->state == ST_CONFIG_SENT) {
         if (hb->cfg->options[0]) {
@@ -103,6 +127,7 @@ static void on_rptack(hbp *hb, const uint8_t *d, int len)
             enc_field(pkt + 8, 300, hb->cfg->options);
             send_raw(hb, pkt, 308);
             hb->state = ST_OPTIONS_SENT;
+            arm_login_timer(hb);
             LOGI(LOGN, "HBP: <- RPTACK(config)  -> RPTO  options=%s", hb->cfg->options);
         } else {
             LOGI(LOGN, "HBP: <- RPTACK(config)  CONNECTED to %s:%d",
@@ -141,6 +166,7 @@ static void ping_cb(ev_loop *loop, void *ud)
 
 static void become_connected(hbp *hb)
 {
+    if (hb->login_timer) { ev_timer_cancel(hb->loop, hb->login_timer); hb->login_timer = NULL; }
     hb->state = ST_CONNECTED;
     hb->last_pong = ev_now(hb->loop);
     hb->ping_timer = ev_timer_after(hb->loop, KA_INTERVAL, ping_cb, hb);
@@ -199,7 +225,8 @@ static void disconnect(hbp *hb, int send_rptcl)
         LOGI(LOGN, "HBP: -> RPTCL (clean disconnect)");
     }
     hb->state = ST_DISCONNECTED;
-    if (hb->ping_timer) { ev_timer_cancel(hb->loop, hb->ping_timer); hb->ping_timer = NULL; }
+    if (hb->ping_timer)  { ev_timer_cancel(hb->loop, hb->ping_timer);  hb->ping_timer  = NULL; }
+    if (hb->login_timer) { ev_timer_cancel(hb->loop, hb->login_timer); hb->login_timer = NULL; }
     if (hb->fd >= 0) { ev_del_fd(hb->loop, hb->fd); close(hb->fd); hb->fd = -1; }
     if (hb->active) schedule_reconnect(hb);
 }
@@ -219,6 +246,7 @@ static void hbp_connect(hbp *hb)
     memcpy(pkt, "RPTL", 4);
     memcpy(pkt + 4, hb->radio_id, 4);
     send_raw(hb, pkt, 8);
+    arm_login_timer(hb);
     LOGI(LOGN, "HBP: -> RPTL  radio_id=%u", hb->cfg->hbp_repeater_id);
 }
 
