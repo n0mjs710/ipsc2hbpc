@@ -55,39 +55,17 @@ static void arm_login_timer(hbp *hb)
     hb->login_timer = ev_timer_after(hb->loop, LOGIN_TIMEOUT, login_timeout_cb, hb);
 }
 
-/* RPTC field encoders, matching DMRGateway's config blob byte for byte.  It
- * builds the whole record with one sprintf:
+/* RPTC field encoders, matching DMRGateway's config-blob sprintf:
  *
  *   "%-8.8s%09u%09u%02u%02u%8.8s%9.9s%03d%-20.20s%-19.19s%c%-124.124s%-40.40s%-40.40s"
  *
- * which is three distinct conventions, not one:
+ *   enc_text  "%-N.Ns"  left-justified, space-filled
+ *   enc_num   "%0Nu"    right-justified, zero-filled
+ *   enc_dec   "%N.Ns"   right-justified, space-filled
  *
- *   enc_text  "%-N.Ns"  left-justified, space-filled   -- callsign, location,
- *                                                         description, url, ids
- *   enc_num   "%0Nu"    right-justified, zero-filled   -- rx/tx freq, power,
- *                                                         colour code, height
- *   enc_dec   "%N.Ns"   right-justified, space-filled  -- latitude, longitude
- *
- * Space and zero rather than NUL: the blob is a fixed-width ASCII record, and
- * HBlink3's peer mode pads it the same way (str.ljust / str.rjust('0')).
- * Masters slice it positionally, so NUL padding logs in and bridges traffic
- * fine -- which is why it went unnoticed for so long -- but it leaves NULs
- * inside what consumers treat as text: a dashboard's json.dumps() carries
- * "W0UK\u0000\u0000\u0000\u0000" where every other repeater is cleanly
- * stripped (Python's str.strip() takes whitespace, not NUL), float("38.8500\0")
- * raises ValueError, and an HBlink4 ACL pattern anchored on the callsign stops
- * matching.
- *
- * Numeric fields are zero-filled on the LEFT because that is what the field
- * means: a power of "5" is "05", a height of "10" is "010". Space-filling them
- * parses but diverges from every other client on the wire.
- *
- * DMRGateway pre-formats latitude/longitude with "%08f"/"%09f", so its strings
- * always fill the width and the right-justification never shows; ours come from
- * config and may be shorter, which is where the " 38.8500" form comes from.
- *
- * Overlong values are truncated to the field width, as the ".N" precision in
- * every one of those conversions does.
+ * Never NUL-filled: a server slices the blob positionally, so NUL padding
+ * connects, but it leaves NULs inside fields consumers read as text.
+ * Overlong values truncate to the field width, as the ".N" precision does.
  */
 static void enc_pad(uint8_t *dst, int n, const char *s, int right, char fill)
 {
@@ -159,14 +137,8 @@ static void on_rptack(hbp *hb, const uint8_t *d, int len)
         LOGI(LOGN, "HBP: <- RPTACK(auth)  -> RPTC (%d bytes)", n);
     } else if (hb->state == ST_CONFIG_SENT) {
         if (hb->cfg->options[0]) {
-            /* Options are variable-length: the master reads the rest of the
-             * datagram as the string, so send exactly what we have and no
-             * padding at all.  DMRGateway's writeOptions() likewise writes
-             * strlen(options) + 8.  Padding this field to a fixed 300 bytes
-             * appends trailing NULs to the last talkgroup, which a master that
-             * parses the subscription has to defend against -- HBlink4 does
-             * (.strip('\x00')), and without that strip its int() conversion
-             * raises and the parser denies every talkgroup on both slots. */
+            /* Variable-length, unpadded: the server reads the rest of the
+             * datagram as the options string. */
             uint8_t pkt[4 + 4 + 300];
             memcpy(pkt, "RPTO", 4);
             memcpy(pkt + 4, hb->radio_id, 4);
