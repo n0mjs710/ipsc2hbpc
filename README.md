@@ -24,23 +24,26 @@ The Python `ipsc2hbp` is a single asyncio process — already simple and effecti
 - **TRACKING mode by default.** The HBP connection follows the repeater: it comes up when the repeater registers and drops when the repeater goes away. PERSISTENT mode is available if you'd rather keep the upstream connection up regardless.
 - **Native call timing on the IPSC side.** Inbound HBP→IPSC voice is clocked out through a jitter buffer at the exact 60 ms DMR cadence — anchored to the first voice burst so every burst gets the full buffer lead — so the repeater sees a continuous grid identical to real MOTOTRBO equipment. The terminator is held until the buffered tail drains, so the call tail is never clipped. Depth is tunable per link via `[hbp] jitter_buffer_depth` (default 2 = 120 ms; raise it for marginal/high-latency RF backhaul).
 - **Rebuild for IPSC what HBP leaves implicit.** The two sides expect different things: an HBP endpoint (MMDVMHost/hotspot) reassembles the audio itself and tolerates jitter, lost bursts, and a stream that isn't fully framed; a MOTOTRBO repeater does not — it plays what it's handed and expects a clean, self-framed DMR stream. So the HBP→IPSC path reconstructs the structure HBP's endpoint would otherwise supply: the embedded LC in every superframe (DMR late entry — rebuilt from the voice stream's `src`/`dst` even when no `VOICE_HEAD` was seen), AMBE silence for any missing burst so the 60 ms grid never stalls, and a `VOICE_TERM` to frame every call end (held until the tail drains, or synthesized by the dead-man if the stream just stops). The one thing never fabricated is the `VOICE_HEAD` packet itself — genuine headers are forwarded, late entry rides the embedded LC instead. See section 7.9 of the Python `ipsc2hbp` theory of operation for the full rationale.
+- **Carry what the repeater knows about the RF.** On the IPSC→HBP path, AMBE frames the repeater flags as uncorrectable are sent as MMDVMHost's silence frame (what an MMDVMHost repeater does with its own unrepairable frames), the repeater's RSSI from each `VOICE_HEAD` / `VOICE_TERM` goes out in DMRD byte 54 (0, HBP's "no reading", on voice bursts), the superframe position re-syncs on every burst A, and the repeater's "sync not detected" placeholders for lost bursts are logged and dropped.
 
 **ARCHITECTURE:**
 
 - `src/dmr/` — self-contained DMR DSP/FEC library (BPTC(196,96), embedded LC, AMBE 49↔72-bit conversion, RS(12,9), Hamming, Golay). This module has **no dependency on the rest of the project** and is validated bit-for-bit against the reference `dmr_utils3` implementation. It is structured so it can be lifted into a standalone library unchanged.
 - `src/` — the application: config loader, logging, event loop, UDP helpers, crypto, the IPSC master/peer protocol, the HBP client, and the bidirectional call translator.
-- `tests/` — a DSP self-test against golden vectors, and a byte-for-byte parity test comparing the C translator output against the Python reference.
+- `tests/` — a DSP self-test against golden vectors, a byte-for-byte parity test comparing the C translator output against the Python reference, and tests that replay traffic captured from a MOTOTRBO repeater and HBlink3.
 
 **VERIFICATION:**
 
 `make test` runs three suites:
 - The DSP self-test confirms every FEC/DSP primitive matches `dmr_utils3` bit-for-bit.
-- The parity test confirms the C translator emits byte-identical DMRD (IPSC→HBP) and GROUP_VOICE (HBP→IPSC) frames versus the Python `ipsc2hbp`.
+- The parity test confirms the C translator emits byte-identical DMRD (IPSC→HBP) and GROUP_VOICE (HBP→IPSC) frames versus the Python `ipsc2hbp`. The same program also replays weak-signal calls captured from a MOTOTRBO repeater to check bad-voice silence, burst-A re-sync, late entry on a degraded burst E, and RSSI decoding.
 - The private-call test replays private calls captured from a MOTOTRBO repeater and HBlink3, in both directions, full and late entry.
+
+Private calls, RSSI forwarding, bad-voice silence and burst-A re-sync are in the C version only; the Python `ipsc2hbp` does not have them. The configuration file is still shared: the one new key, `[ipsc] rssi_encoding`, is optional.
 
 **WHAT IT IS NOT:**
 
-This is not a general-purpose bridge, reflector, or network controller. It does not route between talkgroups, filter, or rewrite calls. It works with HBlink4 and should work with any HBP-speaking network server.
+This is not a general-purpose bridge, reflector, or network controller. It does not route between talkgroups, filter, or rewrite calls. It works with HBlink3 and HBlink4 and should work with any HBP-speaking network server.
 
 **REQUIREMENTS:**
 

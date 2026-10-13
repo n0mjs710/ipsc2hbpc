@@ -29,8 +29,9 @@ This produces the `ipsc2hbpc` binary in the repo root.
 make test
 ```
 
-This validates the DMR DSP/FEC core against golden vectors and checks the
-translator output byte-for-byte against the reference implementation.
+This validates the DMR DSP/FEC core against golden vectors, checks the
+translator output byte-for-byte against the reference implementation, and
+replays traffic captured from a MOTOTRBO repeater and HBlink3.
 
 ## 3 — Install (as root)
 
