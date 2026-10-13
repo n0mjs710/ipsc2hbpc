@@ -90,11 +90,14 @@ TEST_SUPPORT := $(SRC_DIR)/config.c $(SRC_DIR)/toml.c $(SRC_DIR)/log.c \
 # Tests:
 #  - test_dsp:    dmr module vs golden vectors generated from dmr_utils3
 #  - test_parity: C translator output vs Python translator output, byte-for-byte
-test: tests/test_dsp.c tests/test_parity.c $(TEST_SUPPORT)
+#  - test_private: private calls both directions, from captured repeater/HBlink3 traffic
+test: tests/test_dsp.c tests/test_parity.c tests/test_private.c $(TEST_SUPPORT)
 	$(CC) $(CFLAGS) -I. -o /tmp/ipsc2hbpc_test_dsp tests/test_dsp.c $(DMR_SOURCES)
 	/tmp/ipsc2hbpc_test_dsp tests/dsp_vectors.txt
 	$(CC) $(CFLAGS) -I. -o /tmp/ipsc2hbpc_test_parity tests/test_parity.c $(TEST_SUPPORT)
 	/tmp/ipsc2hbpc_test_parity
+	$(CC) $(CFLAGS) -I. -o /tmp/ipsc2hbpc_test_private tests/test_private.c $(TEST_SUPPORT)
+	/tmp/ipsc2hbpc_test_private
 
 clean:
 	rm -f $(OBJECTS) $(BIN)

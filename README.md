@@ -1,6 +1,6 @@
 ## PROJECT: IPSC to HomeBrew Protocol Translator (C) ##
 
-**NOTICE:** This software only supports Group Voice traffic at this time. IPSC is not an open standard. Supporting it involves painstaking reverse engineering of IPSC packets, and much is unknown. IPSC is owned by and heavily protected by Motorola Solutions, Inc. Please do not ask for features that require further deciphering of IPSC without providing verified correct, legally obtained information about the protocol necessary to support a feature.
+**NOTICE:** This software only supports Group and Private (unit-to-unit) Voice traffic at this time; confirmed private calls are not supported. IPSC is not an open standard. Supporting it involves painstaking reverse engineering of IPSC packets, and much is unknown. IPSC is owned by and heavily protected by Motorola Solutions, Inc. Please do not ask for features that require further deciphering of IPSC without providing verified correct, legally obtained information about the protocol necessary to support a feature.
 
 **PURPOSE:** A single, small native daemon that connects a Motorola MOTOTRBO IPSC system to one upstream DMR network server running the open HomeBrew Repeater Protocol (BrandMeister, DMR+, FreeDMR, HBlink4, etc.).
 
@@ -33,9 +33,10 @@ The Python `ipsc2hbp` is a single asyncio process — already simple and effecti
 
 **VERIFICATION:**
 
-`make test` runs two suites:
+`make test` runs three suites:
 - The DSP self-test confirms every FEC/DSP primitive matches `dmr_utils3` bit-for-bit.
 - The parity test confirms the C translator emits byte-identical DMRD (IPSC→HBP) and GROUP_VOICE (HBP→IPSC) frames versus the Python `ipsc2hbp`.
+- The private-call test replays private calls captured from a MOTOTRBO repeater and HBlink3, in both directions, full and late entry.
 
 **WHAT IT IS NOT:**
 

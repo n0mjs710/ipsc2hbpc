@@ -252,24 +252,24 @@ static void master_de_reg_req(ipsc *ip, const uint8_t *d, int len, const char *h
     remove_peer(ip, find_peer(ip, pid));
 }
 
-static void on_group_voice(ipsc *ip, const uint8_t *d, int len, const char *host, int port,
-                           int from_master)
+static void on_voice(ipsc *ip, const uint8_t *d, int len, const char *host, int port,
+                     int from_master)
 {
     if (!from_master) {                    /* master mode: require registered peer */
         if (peer_count(ip) == 0) return;
         if (len < 5 || find_peer(ip, d + 1) < 0) {
-            LOGD(LOGN, "GROUP_VOICE from unregistered peer at %s:%d — dropped", host, port);
+            LOGD(LOGN, "voice 0x%02x from unregistered peer at %s:%d — dropped", d[0], host, port);
             return;
         }
     } else {
         if (!ip->connected) return;
     }
-    if (len < GV_MIN_LEN) { LOGW(LOGN, "GROUP_VOICE too short (%d bytes) from %s:%d", len, host, port); return; }
+    if (len < GV_MIN_LEN) { LOGW(LOGN, "voice 0x%02x too short (%d bytes) from %s:%d", d[0], len, host, port); return; }
 
     int burst_type = d[GV_BURST_TYPE_OFF];
     int call_info  = d[GV_CALL_INFO_OFF];
-    LOGD(LOGN, "GROUP_VOICE len=%d burst=0x%02x raw[0:32]=%s from %s:%d",
-         len, burst_type, log_hex(d, len < 32 ? len : 32), host, port);
+    LOGD(LOGN, "%s len=%d burst=0x%02x raw[0:32]=%s from %s:%d",
+         d[0] == PVT_VOICE ? "PVT_VOICE" : "GROUP_VOICE", len, burst_type, log_hex(d, len < 32 ? len : 32), host, port);
 
     int ts;
     if (burst_type == VOICE_HEAD || burst_type == VOICE_TERM)
@@ -553,8 +553,8 @@ static void recv_cb(ev_loop *loop, int fd, void *ud)
             case MASTER_ALIVE_REQ: master_alive_req(ip, buf, n, host, port); break;
             case PEER_LIST_REQ:    master_peer_list_req(ip, host, port); break;
             case DE_REG_REQ:       master_de_reg_req(ip, buf, n, host, port); break;
-            case GROUP_VOICE:      on_group_voice(ip, buf, n, host, port, 0); break;
-            case PVT_VOICE:        LOGD(LOGN, "PVT_VOICE from %s:%d — ignored", host, port); break;
+            case GROUP_VOICE:      on_voice(ip, buf, n, host, port, 0); break;
+            case PVT_VOICE:        on_voice(ip, buf, n, host, port, 0); break;
             case GROUP_DATA: case PVT_DATA:
                 LOGD(LOGN, "Data packet 0x%02x from %s:%d — ignored", opcode, host, port); break;
             case REPEATER_BLOCKED: LOGD(LOGN, "REPEATER_BLOCKED from %s:%d", host, port); break;
@@ -581,7 +581,8 @@ static void recv_cb(ev_loop *loop, int fd, void *ud)
             return;
         }
         switch (opcode) {
-            case GROUP_VOICE:        on_group_voice(ip, buf, n, host, port, 1); break;
+            case GROUP_VOICE: case PVT_VOICE:
+                                     on_voice(ip, buf, n, host, port, 1); break;
             case MASTER_REG_REPLY:   peer_reg_reply(ip, buf, n, host, port); break;
             case PEER_LIST_REPLY:    ip->missed = 0; ip->state = ST_ACTIVE;
                                      peer_process_list(ip, buf, n); break;
@@ -597,7 +598,7 @@ static void recv_cb(ev_loop *loop, int fd, void *ud)
             case GROUP_DATA: case PVT_DATA:
                 LOGD(LOGN, "Data packet 0x%02x from %s:%d — ignored", opcode, host, port); break;
             case CALL_CONFIRMATION: case TXT_MESSAGE_ACK: case CALL_MON_STATUS: case CALL_MON_RPT:
-            case REPEATER_BLOCKED: case PVT_VOICE: case RPT_WAKE_UP: case CALL_INTERRUPT_REQ:
+            case REPEATER_BLOCKED: case RPT_WAKE_UP: case CALL_INTERRUPT_REQ:
             case DE_REG_REPLY: case UNKNOWN_9E: case WIRELINE: case REMOTE_PROG_REQ:
             case REMOTE_PROG_REPLY: case OPCODE_0xF0:
                 LOGD(LOGN, "opcode 0x%02x from %s:%d — received, not handled", opcode, host, port); break;

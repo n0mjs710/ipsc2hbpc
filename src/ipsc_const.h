@@ -67,6 +67,7 @@
 #define GV_BE_FLAG        0x16 /* data[32] value identifying burst E (carries reassembled LC repeat) */
 #define GV_BE_LC_FLCO_OFF 56   /* FLCO of the reassembled LC repeat carried only on burst E */
 #define FLCO_GROUP        0x00 /* Group Voice Channel User (real call identity); 0x04-0x08 = TA/GPS */
+#define FLCO_PRIVATE      0x03 /* Unit-to-Unit Voice Channel User (private call) */
 
 #define AUTH_DIGEST_LEN   10
 

@@ -102,6 +102,9 @@ static void rand4(uint8_t out[4])
     if (getrandom(out, 4, 0) != 4) { out[0]=rand(); out[1]=rand(); out[2]=rand(); out[3]=rand(); }
 }
 
+/* LC options for a private (unit-to-unit) call: FLCO, FID, service options. */
+static const uint8_t LC_OPT_PVT[3] = {FLCO_PRIVATE, 0x00, 0x00};
+
 /* 72-bit AMBE silence frame from MMDVMHost DMR_SILENCE_DATA; replaces frames the
  * repeater flagged bad (IPSC->HBP). */
 static const uint8_t AMBE_SILENCE_MMDVM[9] = {0xB9,0xE8,0x81,0x52,0x61,0x73,0x00,0x2A,0x6B};
@@ -170,13 +173,13 @@ static void build_embed(translator *tr, int ts, int pos, dmr_bit embed[48])
     memcpy(embed + 40, DMR_EMB[idx] + 8, 8);
 }
 
-/* assemble a complete GROUP_VOICE packet; returns length */
+/* assemble a complete GROUP_VOICE / PVT_VOICE packet; returns length */
 static int build_gv(translator *tr, const uint8_t src[3], const uint8_t dst[3],
                     int call_info, const uint8_t rtp_hdr[12],
-                    const uint8_t *gv_payload, int gv_len, int stream_id, uint8_t *out)
+                    const uint8_t *gv_payload, int gv_len, int stream_id, int pvt, uint8_t *out)
 {
     int p = 0;
-    out[p++] = GROUP_VOICE;
+    out[p++] = pvt ? PVT_VOICE : GROUP_VOICE;
     memcpy(out + p, tr->master_id_b, 4); p += 4;
     out[p++] = (uint8_t)stream_id;
     memcpy(out + p, src, 3); p += 3;
@@ -335,6 +338,10 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
     const uint8_t *src_sub   = data + GV_SRC_SUB_OFF;
     const uint8_t *dst_group = data + GV_DST_GROUP_OFF;
     int flags = (ts == 2) ? HBPF_TGID_TS2 : 0x00;
+    int is_pvt = (data[0] == PVT_VOICE);
+    if (is_pvt) flags |= HBPF_TGID_CALL_P;
+    const uint8_t *lc_opt = is_pvt ? LC_OPT_PVT : DMR_LC_OPT;
+    const char *dst_kind = is_pvt ? "unit" : "tg";
 
     if (len >= 17) {
         tr->peer_call_type = data[12];
@@ -356,15 +363,15 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
             rand4(tr->out_stream_id[ts]);
             tr->out_has_stream[ts] = 1;
             tr->out_ipsc_stream_id[ts] = ipsc_stream_id;
-            LOGI(LOGN, "IPSC call start: src=%u  tg=%u  ts=%d  stream=%s  int_seq_id=0x%02x",
-                 (unsigned)(src_sub[0]<<16|src_sub[1]<<8|src_sub[2]),
+            LOGI(LOGN, "IPSC call start: src=%u  %s=%u  ts=%d  stream=%s  int_seq_id=0x%02x",
+                 (unsigned)(src_sub[0]<<16|src_sub[1]<<8|src_sub[2]), dst_kind,
                  (unsigned)(dst_group[0]<<16|dst_group[1]<<8|dst_group[2]),
                  ts, log_hex(tr->out_stream_id[ts], 4), ipsc_stream_id);
         } else {
             LOGD(LOGN, "Duplicate VOICE_HEAD ts=%d — keeping stream=%s", ts, log_hex(tr->out_stream_id[ts], 4));
         }
         tr->out_frame_pos[ts] = 0;
-        uint8_t lc[9]; memcpy(lc, DMR_LC_OPT, 3); memcpy(lc+3, dst_group, 3); memcpy(lc+6, src_sub, 3);
+        uint8_t lc[9]; memcpy(lc, lc_opt, 3); memcpy(lc+3, dst_group, 3); memcpy(lc+6, src_sub, 3);
         memcpy(tr->out_lc[ts], lc, 9); tr->out_has_lc[ts]=1;
         dmr_encode_emblc(lc, tr->out_emb[ts]); tr->out_has_emb[ts]=1;
         dmr_bit full_lc[196]; dmr_bptc_encode_lc(lc, 0, full_lc);
@@ -380,7 +387,7 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
         if (!tr->out_has_stream[ts]) return;
         uint8_t lc[9];
         if (tr->out_has_lc[ts]) memcpy(lc, tr->out_lc[ts], 9);
-        else { memcpy(lc, DMR_LC_OPT, 3); memcpy(lc+3, dst_group, 3); memcpy(lc+6, src_sub, 3); }
+        else { memcpy(lc, lc_opt, 3); memcpy(lc+3, dst_group, 3); memcpy(lc+6, src_sub, 3); }
         dmr_bit full_lc[196]; dmr_bptc_encode_lc(lc, 1, full_lc);
         dmr_bit fb[264]; int at=0;
         memcpy(fb+at, full_lc, 98); at+=98;
@@ -403,24 +410,25 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
             out_reset_call(tr, ts);
         }
         if (!tr->out_has_stream[ts]) {
-            /* Late entry: anchor identity ONLY to a GVCU burst E.  A burst E carrying
-             * Talker Alias / GPS (FLCO != GROUP at byte 56) puts alias bytes in the header
-             * src/dst, so we must not adopt them — wait for the next GVCU superframe. */
+            /* Late entry: anchor identity ONLY to a burst E carrying the voice LC (GVCU for
+             * group, UU_V_Ch_Usr for private).  A burst E carrying Talker Alias / GPS puts
+             * alias bytes in the header src/dst, so we must not adopt them — wait for the
+             * next voice-LC superframe. */
             if (len <= GV_BE_LC_FLCO_OFF || data[32] != GV_BE_FLAG) return;
-            if (data[GV_BE_LC_FLCO_OFF] != FLCO_GROUP) {
-                LOGD(LOGN, "IPSC late entry deferred ts=%d — burst E embedded LC is non-GVCU "
-                           "(flco=0x%02x, Talker Alias/GPS); waiting for GVCU superframe",
+            if (data[GV_BE_LC_FLCO_OFF] != (is_pvt ? FLCO_PRIVATE : FLCO_GROUP)) {
+                LOGD(LOGN, "IPSC late entry deferred ts=%d — burst E embedded LC is not the voice LC "
+                           "(flco=0x%02x, Talker Alias/GPS); waiting for voice-LC superframe",
                      ts, data[GV_BE_LC_FLCO_OFF]);
                 return;
             }
-            uint8_t lc[9]; memcpy(lc, DMR_LC_OPT, 3); memcpy(lc+3, dst_group, 3); memcpy(lc+6, src_sub, 3);
+            uint8_t lc[9]; memcpy(lc, lc_opt, 3); memcpy(lc+3, dst_group, 3); memcpy(lc+6, src_sub, 3);
             rand4(tr->out_stream_id[ts]); tr->out_has_stream[ts]=1;
             tr->out_ipsc_stream_id[ts]=ipsc_stream_id;
             memcpy(tr->out_lc[ts], lc, 9); tr->out_has_lc[ts]=1;
             dmr_encode_emblc(lc, tr->out_emb[ts]); tr->out_has_emb[ts]=1;
             tr->out_frame_pos[ts]=4;
-            LOGI(LOGN, "IPSC late entry: ts=%d src=%u tg=%u — LC from GVCU Burst E, stream=%s  int_seq_id=0x%02x",
-                 ts, (unsigned)(src_sub[0]<<16|src_sub[1]<<8|src_sub[2]),
+            LOGI(LOGN, "IPSC late entry: ts=%d src=%u %s=%u — LC from Burst E, stream=%s  int_seq_id=0x%02x",
+                 ts, (unsigned)(src_sub[0]<<16|src_sub[1]<<8|src_sub[2]), dst_kind,
                  (unsigned)(dst_group[0]<<16|dst_group[1]<<8|dst_group[2]),
                  log_hex(tr->out_stream_id[ts], 4), ipsc_stream_id);
         }
@@ -456,7 +464,7 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
     uint8_t fb_lc[9];
     const uint8_t *locked_lc;
     if (tr->out_has_lc[ts]) { locked_lc = tr->out_lc[ts]; }
-    else { memcpy(fb_lc, DMR_LC_OPT, 3); memcpy(fb_lc+3, dst_group, 3); memcpy(fb_lc+6, src_sub, 3); locked_lc = fb_lc; }
+    else { memcpy(fb_lc, lc_opt, 3); memcpy(fb_lc+3, dst_group, 3); memcpy(fb_lc+6, src_sub, 3); locked_lc = fb_lc; }
     const uint8_t *out_dst = locked_lc + 3;
     const uint8_t *out_src = locked_lc + 6;
 
@@ -475,8 +483,8 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
     hbp_send_dmrd(tr->hb, dmrd, p);
 
     if (burst_type == VOICE_TERM) {
-        LOGI(LOGN, "IPSC call end:   src=%u  tg=%u  ts=%d  stream=%s  int_seq_id=0x%02x",
-             (unsigned)(out_src[0]<<16|out_src[1]<<8|out_src[2]),
+        LOGI(LOGN, "IPSC call end:   src=%u  %s=%u  ts=%d  stream=%s  int_seq_id=0x%02x",
+             (unsigned)(out_src[0]<<16|out_src[1]<<8|out_src[2]), dst_kind,
              (unsigned)(out_dst[0]<<16|out_dst[1]<<8|out_dst[2]),
              ts, log_hex(tr->out_stream_id[ts], 4), tr->out_ipsc_stream_id[ts]);
         out_reset_call(tr, ts);
@@ -561,7 +569,7 @@ static void clear_in_call(translator *tr, int ts)
     tr->in_has_emb[ts] = 0;
 }
 
-/* Build and send one inbound GROUP_VOICE frame; advance RTP counters. */
+/* Build and send one inbound GROUP_VOICE / PVT_VOICE frame; advance RTP counters. */
 static void emit_in(translator *tr, int ts, const uint8_t *lc, int call_info,
                     int rtp_pt, const uint8_t *gv_payload, int gv_len, int advance_ts)
 {
@@ -572,8 +580,9 @@ static void emit_in(translator *tr, int ts, const uint8_t *lc, int call_info,
     rtp_hdr[6]=(uint8_t)(tr->in_rtp_ts[ts]>>8); rtp_hdr[7]=(uint8_t)(tr->in_rtp_ts[ts]);
     tr->in_rtp_seq[ts]++;
     uint8_t gv[128];
+    int pvt = (lc[0] & 0x3F) == FLCO_PRIVATE;   /* opcode follows the LC's FLCO */
     int n = build_gv(tr, lc + 6, lc + 3, call_info, rtp_hdr, gv_payload, gv_len,
-                     tr->in_stream_id[ts], gv);
+                     tr->in_stream_id[ts], pvt, gv);
     ipsc_send_voice(tr->ip, gv, n);
 }
 
@@ -584,8 +593,8 @@ static void emit_term(translator *tr, int ts)
     uint8_t gv_payload[24]; gv_payload[0]=VOICE_TERM;
     build_ipsc_voice_payload(lc, VOICE_TERM, gv_payload+1);
     emit_in(tr, ts, lc, call_info, 0x5e, gv_payload, 24, 0);
-    LOGI(LOGN, "HBP call end:   src=%u  tg=%u  ts=%d  ipsc_id=0x%02x",
-         (unsigned)(lc[6]<<16|lc[7]<<8|lc[8]),
+    LOGI(LOGN, "HBP call end:   src=%u  %s=%u  ts=%d  ipsc_id=0x%02x",
+         (unsigned)(lc[6]<<16|lc[7]<<8|lc[8]), (lc[0] & 0x3F) == FLCO_PRIVATE ? "unit" : "tg",
          (unsigned)(lc[3]<<16|lc[4]<<8|lc[5]), ts, tr->in_stream_id[ts]);
     clear_in_call(tr, ts);
 }
@@ -648,6 +657,7 @@ void translator_hbp_voice_received(translator *tr, const uint8_t *dmrd, int len)
     const uint8_t *payload_33 = dmrd + DMRD_PAYLOAD_OFF;
 
     int ts = (flags & HBPF_TGID_TS2) ? 2 : 1;
+    const uint8_t *lc_opt = (flags & HBPF_TGID_CALL_P) ? LC_OPT_PVT : DMR_LC_OPT;
     tr->in_last_pkt[ts] = ev_now(tr->loop);
     int frame_type = flags & HBPF_FRAMETYPE_MASK;
     int dtype = flags & HBPF_DTYPE_MASK;
@@ -667,8 +677,9 @@ void translator_hbp_voice_received(translator *tr, const uint8_t *dmrd, int len)
             memcpy(tr->in_hbp_stream[ts], hbp_stream, 4); tr->in_has_hbp_stream[ts]=1;
             tr->in_stream_ctr = (tr->in_stream_ctr + 1) & 0xFF;
             tr->in_stream_id[ts] = tr->in_stream_ctr;
-            LOGI(LOGN, "HBP call start: src=%u  tg=%u  ts=%d  stream=%s  ipsc_id=0x%02x",
+            LOGI(LOGN, "HBP call start: src=%u  %s=%u  ts=%d  stream=%s  ipsc_id=0x%02x",
                  (unsigned)(src_sub[0]<<16|src_sub[1]<<8|src_sub[2]),
+                 (lc[0] & 0x3F) == FLCO_PRIVATE ? "unit" : "tg",
                  (unsigned)(dst_group[0]<<16|dst_group[1]<<8|dst_group[2]),
                  ts, log_hex(hbp_stream, 4), tr->in_stream_id[ts]);
         } else {
@@ -694,7 +705,7 @@ void translator_hbp_voice_received(translator *tr, const uint8_t *dmrd, int len)
         if (!tr->in_has_lc[ts]) {
             /* Terminator with no active call — build a fallback LC so we can
              * still relay a clean call end. */
-            uint8_t lc[9]; memcpy(lc, DMR_LC_OPT, 3); memcpy(lc+3, dst_group, 3); memcpy(lc+6, src_sub, 3);
+            uint8_t lc[9]; memcpy(lc, lc_opt, 3); memcpy(lc+3, dst_group, 3); memcpy(lc+6, src_sub, 3);
             memcpy(tr->in_lc[ts], lc, 9); tr->in_has_lc[ts]=1;
             dmr_encode_emblc(lc, tr->in_emb[ts]); tr->in_has_emb[ts]=1;
             if (!tr->in_has_hbp_stream[ts]) {
@@ -720,15 +731,16 @@ void translator_hbp_voice_received(translator *tr, const uint8_t *dmrd, int len)
         clear_in_call(tr, ts);
     }
     if (!tr->in_has_lc[ts]) {
-        uint8_t lc[9]; memcpy(lc, DMR_LC_OPT, 3); memcpy(lc+3, dst_group, 3); memcpy(lc+6, src_sub, 3);
+        uint8_t lc[9]; memcpy(lc, lc_opt, 3); memcpy(lc+3, dst_group, 3); memcpy(lc+6, src_sub, 3);
         memcpy(tr->in_lc[ts], lc, 9); tr->in_has_lc[ts]=1;
         dmr_encode_emblc(lc, tr->in_emb[ts]); tr->in_has_emb[ts]=1;
         memcpy(tr->in_hbp_stream[ts], hbp_stream, 4); tr->in_has_hbp_stream[ts]=1;
         tr->in_stream_ctr = (tr->in_stream_ctr + 1) & 0xFF;
         tr->in_stream_id[ts] = tr->in_stream_ctr;
         tr->in_rtp_seq[ts] = 0; tr->in_rtp_ts[ts] = 0;
-        LOGI(LOGN, "HBP late entry: ts=%d src=%u tg=%u — LC from stream, hbp_stream=%s",
+        LOGI(LOGN, "HBP late entry: ts=%d src=%u %s=%u — LC from stream, hbp_stream=%s",
              ts, (unsigned)(src_sub[0]<<16|src_sub[1]<<8|src_sub[2]),
+             (flags & HBPF_TGID_CALL_P) ? "unit" : "tg",
              (unsigned)(dst_group[0]<<16|dst_group[1]<<8|dst_group[2]), log_hex(hbp_stream, 4));
     }
     int cur_pos;
