@@ -301,6 +301,11 @@ static void on_voice(ipsc *ip, const uint8_t *d, int len, const char *host, int 
         ip->vlock[ts].set = 1;
     }
 
+    if ((burst_type & 0x7F) == SYNC_UNDETECT) {
+        LOGI(LOGN, "IPSC sync not detected ts=%d — repeater lost a burst, not forwarded", ts);
+        return;
+    }
+
     translator_ipsc_voice_received(ip->tr, d, len, ts, burst_type);
 }
 

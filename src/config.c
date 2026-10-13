@@ -250,7 +250,7 @@ int config_load(const char *path, Config *cfg, char *err, size_t errlen)
                          /* remove spaces */
                          char clean[32]; int cn=0; for (char *p=raw;*p;p++) if(*p!=' ') clean[cn++]=*p; clean[cn]=0;
                          if (cn != 8) adderr(&e,"[ipsc.capabilities] ipsc_version: must be exactly 8 hex characters (4 bytes)");
-                         else snprintf(ver,sizeof ver,"%s",clean); } }
+                         else snprintf(ver,sizeof ver,"%.8s",clean); } }
         int ok=1; for (int i=0;i<8;i++) if(!isxdigit((unsigned char)ver[i])) ok=0;
         if (!ok) { adderr(&e,"[ipsc.capabilities] ipsc_version: not valid hex"); strcpy(ver,"04020401"); }
         for (int i=0;i<4;i++){ char by[3]={ver[i*2],ver[i*2+1],0}; cfg->ipsc_version[i]=(uint8_t)strtol(by,NULL,16); }

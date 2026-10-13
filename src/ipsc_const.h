@@ -40,6 +40,7 @@
 #define VOICE_TERM  0x02
 #define SLOT1_VOICE 0x0A
 #define SLOT2_VOICE 0x8A
+#define SYNC_UNDETECT 0x13 /* repeater lost this burst (no sync): 34-byte placeholder, TS in bit 7 */
 
 /* GROUP_VOICE byte 17 (call_info) masks */
 #define TS_CALL_MSK 0x20   /* bit 5: 1=TS2 */

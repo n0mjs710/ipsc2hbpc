@@ -60,7 +60,8 @@ static void timestamp(char *buf, size_t n)
     localtime_r(&tv.tv_sec, &tm);
     char base[32];
     strftime(base, sizeof base, "%Y-%m-%d %H:%M:%S", &tm);
-    snprintf(buf, n, "%s,%03d", base, (int)(tv.tv_usec / 1000));
+    unsigned ms = (unsigned)(tv.tv_usec / 1000) % 1000u;
+    snprintf(buf, n, "%s,%03u", base, ms);
 }
 
 void log_msg(int level, const char *name, const char *fmt, ...)
