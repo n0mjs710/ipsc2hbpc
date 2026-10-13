@@ -194,7 +194,47 @@ int main(void)
         }
     }
     printf("Superframe re-sync (IPSC->HBP): %d burst A checked, %d failures\n", sync_seen, sync_fails);
+    translator_free(tr);
 
-    translator_free(tr); ev_free(loop);
-    return (fails || in_fails || bad_fails || sync_fails) ? 1 : 0;
+    /* ---- late entry on weak signal (IPSC->HBP): weak-signal call 3120101 -> TG 2.
+     * Joining at packet 4, the first burst E (packet 8, ctrl 0x96) has a corrupt LC and
+     * must be skipped; anchor on packet 14 (0x16).  Joining at packet 33, the first
+     * burst E (packet 38, ctrl 0x17: voice frame bad, LC good) is usable. ---- */
+    static const int le_join[2] = {4, 33}, le_anchor[2] = {14, 38};
+    int le_fails = 0;
+    for (int c = 0; c < 2; c++) {
+        tr = translator_new(&cfg, loop);
+        translator_set_protocols(tr, (struct ipsc *)1, (struct hbp *)1);
+        ncap = 0;
+        int idx = -1, anchor = -1;
+        fi = fopen("tests/lateentry_ipsc_in.txt", "r");
+        while (fi && fgets(line, sizeof line, fi)) {
+            int ts, bt; char hex[400];
+            if (sscanf(line, "%d %d %399s", &ts, &bt, hex) != 3) continue;
+            idx++;
+            if (idx < le_join[c] || bt == 1 || (bt & 0x7F) == 0x13) continue;
+            uint8_t raw[400]; int n = unhex(hex, raw);
+            int before = ncap;
+            translator_ipsc_voice_received(tr, raw, n, ts, bt);
+            if (anchor < 0 && ncap > before) anchor = idx;
+        }
+        if (fi) fclose(fi);
+        if (anchor != le_anchor[c]) {
+            fprintf(stderr, "FAIL late entry: joined at %d, anchored at packet %d, want %d\n", le_join[c], anchor, le_anchor[c]);
+            le_fails++;
+        }
+        for (int i = 0; i < ncap; i++) {
+            unsigned src = (unsigned)(cap[i][5]<<16 | cap[i][6]<<8 | cap[i][7]);
+            unsigned dst = (unsigned)(cap[i][8]<<16 | cap[i][9]<<8 | cap[i][10]);
+            if (src != 3120101 || dst != 2) {
+                fprintf(stderr, "FAIL late entry: joined at %d, DMRD[%d] %u->%u, want 3120101->2\n", le_join[c], i, src, dst);
+                le_fails++; break;
+            }
+        }
+        translator_free(tr);
+    }
+    printf("Late entry on weak signal (IPSC->HBP): %d failures\n", le_fails);
+
+    ev_free(loop);
+    return (fails || in_fails || bad_fails || sync_fails || le_fails) ? 1 : 0;
 }

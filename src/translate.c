@@ -414,7 +414,12 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
              * group, UU_V_Ch_Usr for private).  A burst E carrying Talker Alias / GPS puts
              * alias bytes in the header src/dst, so we must not adopt them — wait for the
              * next voice-LC superframe. */
-            if (len <= GV_BE_LC_FLCO_OFF || data[32] != GV_BE_FLAG) return;
+            int ctrl = data[GV_CTRL_OFF];
+            if (len <= GV_BE_LC_FLCO_OFF || !(ctrl & GV_CTRL_EMB_LC)) return;
+            if (ctrl & GV_CTRL_LC_ERR) {
+                LOGD(LOGN, "IPSC late entry deferred ts=%d — burst E embedded LC failed its check", ts);
+                return;
+            }
             if (data[GV_BE_LC_FLCO_OFF] != (is_pvt ? FLCO_PRIVATE : FLCO_GROUP)) {
                 LOGD(LOGN, "IPSC late entry deferred ts=%d — burst E embedded LC is not the voice LC "
                            "(flco=0x%02x, Talker Alias/GPS); waiting for voice-LC superframe",
@@ -439,14 +444,14 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
         dmr_bit raw[152]; dmr_bytes_to_bits(data + GV_AMBE_OFF, 19, raw);
         dmr_bit a1_72[72], a2_72[72], a3_72[72];
         dmr_bit *a72[3] = {a1_72, a2_72, a3_72};
-        int bad[3] = {data[GV_BAD1_OFF] & GV_BAD1_MSK, raw[GV_BAD2_BIT], raw[GV_BAD3_BIT]};
+        int bad[3] = {data[GV_CTRL_OFF] & GV_CTRL_BAD1, raw[GV_BAD2_BIT], raw[GV_BAD3_BIT]};
         for (int i = 0; i < 3; i++) {
             if (bad[i]) dmr_bytes_to_bits(AMBE_SILENCE_MMDVM, 9, a72[i]);
             else        dmr_ambe_49_to_72(raw + 50 * i, a72[i]);
         }
         if (bad[0] || bad[1] || bad[2])
             LOGD(LOGN, "IPSC bad AMBE ts=%d flags=%d%d%d — sent as silence", ts, bad[0], bad[1], bad[2]);
-        if (data[GV_SYNC_OFF] & GV_SYNC_MSK) tr->out_frame_pos[ts] = 0;   /* burst A: re-sync superframe */
+        if (data[GV_CTRL_OFF] & GV_CTRL_SYNC) tr->out_frame_pos[ts] = 0;   /* burst A: re-sync superframe */
         int pos = tr->out_frame_pos[ts] % 6;
         dmr_bit embed[48]; build_embed(tr, ts, pos, embed);
         dmr_bit fb[264]; int at=0;

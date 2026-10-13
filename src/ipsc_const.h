@@ -58,16 +58,15 @@
 #define GV_BURST_TYPE_OFF 30
 #define GV_PAYLOAD_OFF    31
 #define GV_MIN_LEN        31
+/* Voice burst control byte (data[32]); bit names after node-dmr-lib DMRVoicePayload. */
+#define GV_CTRL_OFF       32
+#define GV_CTRL_LC_ERR    0x80 /* embedded LC failed its check (burst E LC is corrupt) */
+#define GV_CTRL_SYNC      0x40 /* burst carries voice sync (burst A) */
+#define GV_CTRL_EMB_LC    0x10 /* reassembled embedded LC present (burst E) */
+#define GV_CTRL_BAD1      0x01 /* AMBE frame 1 uncorrectable on RF receive */
 #define GV_AMBE_OFF       33   /* 19-byte AMBE field: three 49-bit frames at bits 0, 50, 100 */
-/* Repeater-set "bad voice" flags, one per AMBE frame (uncorrectable on RF receive):
- * frame 1 = data[32] bit 0; frames 2/3 = bits 49/99 of the AMBE field. */
-#define GV_BAD1_OFF       32
-#define GV_SYNC_OFF       32   /* data[32] & GV_SYNC_MSK: burst carries voice sync (burst A) */
-#define GV_SYNC_MSK       0x40
-#define GV_BAD1_MSK       0x01
-#define GV_BAD2_BIT       49
-#define GV_BAD3_BIT       99
-#define GV_BE_FLAG        0x16 /* data[32] value identifying burst E (carries reassembled LC repeat) */
+#define GV_BAD2_BIT       49   /* AMBE field bit: frame 2 uncorrectable */
+#define GV_BAD3_BIT       99   /* AMBE field bit: frame 3 uncorrectable */
 #define GV_BE_LC_FLCO_OFF 56   /* FLCO of the reassembled LC repeat carried only on burst E */
 #define FLCO_GROUP        0x00 /* Group Voice Channel User (real call identity); 0x04-0x08 = TA/GPS */
 #define FLCO_PRIVATE      0x03 /* Unit-to-Unit Voice Channel User (private call) */
