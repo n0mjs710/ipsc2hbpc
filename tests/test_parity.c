@@ -235,6 +235,43 @@ int main(void)
     }
     printf("Late entry on weak signal (IPSC->HBP): %d failures\n", le_fails);
 
+    /* ---- RSSI (IPSC->HBP): DMRD byte 54 from captured VOICE_HEAD / VOICE_TERM, 0 on
+     * voice bursts.  pvt_ipsc_in.txt raw 40a7 40b8 40bd 40c2 (heads), 3f4e (term);
+     * lateentry_ipsc_in.txt raw 705d 6fff 70a2 70f0 (heads), no term. ---- */
+    static const char *rs_file[2] = {"tests/pvt_ipsc_in.txt", "tests/lateentry_ipsc_in.txt"};
+    static const int rs_new[2][5] = {{65, 65, 65, 65, 63}, {112, 112, 113, 113, -1}};
+    int rs_fails = 0;
+    for (int old = 0; old < 2; old++) {
+        Config c2 = cfg; c2.ipsc_rssi_old = old;
+        for (int fidx = 0; fidx < 2; fidx++) {
+            tr = translator_new(&c2, loop);
+            translator_set_protocols(tr, (struct ipsc *)1, (struct hbp *)1);
+            ncap = 0;
+            fi = fopen(rs_file[fidx], "r");
+            while (fi && fgets(line, sizeof line, fi)) {
+                int ts, bt; char hex[400];
+                if (sscanf(line, "%d %d %399s", &ts, &bt, hex) != 3) continue;
+                if ((bt & 0x7F) == 0x13) continue;
+                uint8_t raw[400]; int n = unhex(hex, raw);
+                translator_ipsc_voice_received(tr, raw, n, ts, bt);
+            }
+            if (fi) fclose(fi);
+            int k = 0;
+            for (int i = 0; i < ncap; i++) {
+                int fl = cap[i][15], got = cap[i][54];
+                int want = 0;
+                if ((fl & 0x30) == 0x20) { want = rs_new[fidx][k++]; if (want >= 0) want += old ? 56 : 0; }
+                if (got != want) {
+                    fprintf(stderr, "FAIL rssi: %s %s DMRD[%d] flags 0x%02x byte54=%d, want %d\n",
+                            rs_file[fidx], old ? "old" : "new", i, fl, got, want);
+                    rs_fails++;
+                }
+            }
+            translator_free(tr);
+        }
+    }
+    printf("RSSI (IPSC->HBP): %d failures\n", rs_fails);
+
     ev_free(loop);
-    return (fails || in_fails || bad_fails || sync_fails || le_fails) ? 1 : 0;
+    return (fails || in_fails || bad_fails || sync_fails || le_fails || rs_fails) ? 1 : 0;
 }

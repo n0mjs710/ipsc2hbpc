@@ -108,6 +108,25 @@ keepalive_watchdog = 60
 ts_prefer_call_info = false
 
 # ---------------------------------------------------------------------------
+# RSSI encoding
+#
+# The repeater reports the received signal strength of each call in its
+# VOICE_HEAD and VOICE_TERM packets (voice bursts carry none).  ipsc2hbp sends
+# it to the HBP server in DMRD byte 54 of those packets as -dBm (80 = -80 dBm);
+# every other DMRD carries 0, HBP's "no reading" value.
+#
+# MOTOTRBO firmware has used two encodings of this value:
+#   "new" : 8.8 fixed-point -dBm
+#   "old" : the same, offset by 56 dB (raw 0 = -56 dBm)
+# The change is believed to be around repeater firmware 2.30.10.0, but that
+# version is not confirmed.  Only "new" has been tested on a repeater.  If the
+# levels reported are about 56 dB too strong, try "old".
+#
+# Decoding and both encodings from node-dmr-lib by rick51231 (MIT licence).
+# ---------------------------------------------------------------------------
+rssi_encoding = "new"
+
+# ---------------------------------------------------------------------------
 # IPSC capability advertisement
 #
 # WARNING: These fields control what ipsc2hbp tells IPSC peers about its

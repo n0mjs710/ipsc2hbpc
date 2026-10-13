@@ -67,6 +67,13 @@
 #define GV_AMBE_OFF       33   /* 19-byte AMBE field: three 49-bit frames at bits 0, 50, 100 */
 #define GV_BAD2_BIT       49   /* AMBE field bit: frame 2 uncorrectable */
 #define GV_BAD3_BIT       99   /* AMBE field bit: frame 3 uncorrectable */
+/* VOICE_HEAD / VOICE_TERM payload (after node-dmr-lib DMRDataPayload) */
+#define GV_RSSI_FLAG_OFF  34   /* bit 7: RSSI present */
+#define GV_RSSI_FLAG_MSK  0x80
+#define GV_SLOTTYPE_OFF   35   /* bit 3: 2-byte slot type follows the data */
+#define GV_SLOTTYPE_MSK   0x08
+#define GV_DATA_BITS_OFF  36   /* 16-bit data length in bits */
+#define GV_DATA_OFF       38   /* data, then slot type, then 16-bit RSSI */
 #define GV_BE_LC_FLCO_OFF 56   /* FLCO of the reassembled LC repeat carried only on burst E */
 #define FLCO_GROUP        0x00 /* Group Voice Channel User (real call identity); 0x04-0x08 = TA/GPS */
 #define FLCO_PRIVATE      0x03 /* Unit-to-Unit Voice Channel User (private call) */

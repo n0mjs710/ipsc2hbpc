@@ -301,6 +301,22 @@ static int out_call_continues(uint32_t rtp_now, int has_rtp, uint32_t prev_rtp, 
     return 1;
 }
 
+/* RSSI carried in a VOICE_HEAD / VOICE_TERM, as the DMRD byte-54 value (-dBm magnitude);
+ * 0 = no reading.  The raw value is 8.8 fixed-point -dBm; the old firmware encoding adds a
+ * 56 dB offset (node-dmr-lib, rick51231).  Voice bursts carry no RSSI. */
+static uint8_t ipsc_rssi(const translator *tr, const uint8_t *d, int len)
+{
+    if (len < GV_DATA_OFF || !(d[GV_RSSI_FLAG_OFF] & GV_RSSI_FLAG_MSK)) return 0;
+    int bits = (d[GV_DATA_BITS_OFF] << 8) | d[GV_DATA_BITS_OFF + 1];
+    int off = GV_DATA_OFF + (bits + 15) / 16 * 2 + ((d[GV_SLOTTYPE_OFF] & GV_SLOTTYPE_MSK) ? 2 : 0);
+    if (off + 2 > len) return 0;
+    int raw = (d[off] << 8) | d[off + 1];
+    if (raw == 0) return 0;
+    int v = (raw + 128) >> 8;
+    if (tr->cfg->ipsc_rssi_old) v += 56;
+    return (uint8_t)(v > 255 ? 255 : v);
+}
+
 void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len, int ts, int burst_type)
 {
     if (!hbp_is_connected(tr->hb)) return;
@@ -349,6 +365,7 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
     }
 
     uint8_t payload_33[33];
+    uint8_t rssi = 0;
 
     if (burst_type == VOICE_HEAD) {
         if (tr->out_has_stream[ts] && tr->out_ipsc_stream_id[ts] >= 0 &&
@@ -383,6 +400,7 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
         memcpy(fb+at, full_lc+98, 98); at+=98;
         dmr_bits_to_bytes(fb, 264, payload_33);
         flags |= HBPF_FRAMETYPE_DATASYNC | HBPF_SLT_VHEAD;
+        rssi = ipsc_rssi(tr, data, len);
     } else if (burst_type == VOICE_TERM) {
         if (!tr->out_has_stream[ts]) return;
         uint8_t lc[9];
@@ -397,6 +415,7 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
         memcpy(fb+at, full_lc+98, 98); at+=98;
         dmr_bits_to_bytes(fb, 264, payload_33);
         flags |= HBPF_FRAMETYPE_DATASYNC | HBPF_SLT_VTERM;
+        rssi = ipsc_rssi(tr, data, len);
     } else {
         /* SLOT1_VOICE / SLOT2_VOICE.  Boundary detection: the IPSC call-seq (byte 5) is
          * deliberately NOT consulted — current XPR8400 firmware mints a new call-seq every
@@ -484,7 +503,8 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
     dmrd[p++] = (uint8_t)flags;
     memcpy(dmrd+p, tr->out_stream_id[ts], 4); p+=4;
     memcpy(dmrd+p, payload_33, 33); p+=33;
-    dmrd[p++] = 0x00; dmrd[p++] = 0x00;   /* BER + RSSI */
+    dmrd[p++] = 0x00;                     /* BER */
+    dmrd[p++] = rssi;                     /* RSSI: head/term only, 0 = no reading */
     tr->out_seq = (tr->out_seq + 1) & 0xFF;
     hbp_send_dmrd(tr->hb, dmrd, p);
 

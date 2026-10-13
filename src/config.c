@@ -151,6 +151,9 @@ int config_load(const char *path, Config *cfg, char *err, size_t errlen)
 
     { static const char *M[] = {"MASTER","PEER"};
       get_choice(t, &e, "ipsc", "mode", 0, "MASTER", M, 2, cfg->ipsc_mode, sizeof cfg->ipsc_mode); }
+    { static const char *RE[] = {"new","old"}; char re[8];
+      get_choice(t, &e, "ipsc", "rssi_encoding", 0, "new", RE, 2, re, sizeof re);
+      cfg->ipsc_rssi_old = !strcmp(re, "old"); }
 
     if (!strcmp(cfg->ipsc_mode, "PEER")) {
         get_str(t, &e, "ipsc", "master_ip", 1, "", cfg->ipsc_master_ip, sizeof cfg->ipsc_master_ip);
