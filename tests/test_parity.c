@@ -155,7 +155,46 @@ int main(void)
         }
     }
     printf("Bad-voice flags (IPSC->HBP): %d failures\n", bad_fails);
+    translator_free(tr);
+
+    /* ---- superframe re-sync (IPSC->HBP): weak-signal call where the repeater lost a
+     * burst (0x13 placeholder, dropped in ipsc.c) and restarted at burst A ---- */
+    int sync_fails = 0, sync_seen = 0;
+    tr = translator_new(&cfg, loop);
+    translator_set_protocols(tr, (struct ipsc *)1, (struct hbp *)1);
+    ncap = 0;
+    int want_sync[MAXCAP];
+    int nin = 0;
+    fi = fopen("tests/synclost_ipsc_in.txt", "r");
+    while (fi && fgets(line, sizeof line, fi)) {
+        int ts, bt; char hex[400];
+        if (sscanf(line, "%d %d %399s", &ts, &bt, hex) != 3) continue;
+        if ((bt & 0x7F) == 0x13) continue;
+        uint8_t raw[400]; int n = unhex(hex, raw);
+        if (nin < MAXCAP) want_sync[nin++] = (bt != 1 && bt != 2) ? ((raw[32] & 0x40) ? 1 : 0) : -1;
+        translator_ipsc_voice_received(tr, raw, n, ts, bt);
+    }
+    if (fi) fclose(fi);
+    if (ncap != nin) { fprintf(stderr, "FAIL re-sync: %d IPSC packets -> %d DMRD\n", nin, ncap); sync_fails++; }
+    int expect_pos = -1;
+    for (int i = 0; i < ncap && i < nin; i++) {
+        if (want_sync[i] < 0) continue;
+        int fl = cap[i][15];
+        int is_sync = (fl & 0x30) == 0x10;
+        if (want_sync[i]) {
+            sync_seen++;
+            if (!is_sync) { fprintf(stderr, "FAIL re-sync: DMRD[%d] burst A sent as flags 0x%02x\n", i, fl); sync_fails++; }
+            expect_pos = 1;
+        } else if (expect_pos > 0) {
+            if (is_sync || (fl & 0x0F) != expect_pos) {
+                fprintf(stderr, "FAIL re-sync: DMRD[%d] flags 0x%02x, want voice burst %d\n", i, fl, expect_pos);
+                sync_fails++;
+            }
+            expect_pos++;
+        }
+    }
+    printf("Superframe re-sync (IPSC->HBP): %d burst A checked, %d failures\n", sync_seen, sync_fails);
 
     translator_free(tr); ev_free(loop);
-    return (fails || in_fails || bad_fails) ? 1 : 0;
+    return (fails || in_fails || bad_fails || sync_fails) ? 1 : 0;
 }

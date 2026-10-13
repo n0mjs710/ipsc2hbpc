@@ -62,6 +62,8 @@
 /* Repeater-set "bad voice" flags, one per AMBE frame (uncorrectable on RF receive):
  * frame 1 = data[32] bit 0; frames 2/3 = bits 49/99 of the AMBE field. */
 #define GV_BAD1_OFF       32
+#define GV_SYNC_OFF       32   /* data[32] & GV_SYNC_MSK: burst carries voice sync (burst A) */
+#define GV_SYNC_MSK       0x40
 #define GV_BAD1_MSK       0x01
 #define GV_BAD2_BIT       49
 #define GV_BAD3_BIT       99

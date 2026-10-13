@@ -446,6 +446,7 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
         }
         if (bad[0] || bad[1] || bad[2])
             LOGD(LOGN, "IPSC bad AMBE ts=%d flags=%d%d%d — sent as silence", ts, bad[0], bad[1], bad[2]);
+        if (data[GV_SYNC_OFF] & GV_SYNC_MSK) tr->out_frame_pos[ts] = 0;   /* burst A: re-sync superframe */
         int pos = tr->out_frame_pos[ts] % 6;
         dmr_bit embed[48]; build_embed(tr, ts, pos, embed);
         dmr_bit fb[264]; int at=0;
