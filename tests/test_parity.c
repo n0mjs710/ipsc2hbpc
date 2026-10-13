@@ -8,6 +8,7 @@
 #include "../src/translate.h"
 #include "../src/config.h"
 #include "../src/eventloop.h"
+#include "../src/dmr/dmr.h"
 
 /* ---- captured DMRD output ---- */
 #define MAXCAP 64
@@ -114,7 +115,47 @@ int main(void)
     }
     if (fi) fclose(fi);
     if (fr) fclose(fr);
+    translator_free(tr);
+
+    /* ---- bad-voice flags (IPSC->HBP): flagged AMBE frames become MMDVMHost silence ---- */
+    static const uint8_t SIL[9] = {0xB9,0xE8,0x81,0x52,0x61,0x73,0x00,0x2A,0x6B};
+    static const int want[2][3] = {{1,1,1}, {0,1,0}};   /* per voice frame: flagged? */
+    int bad_fails = 0;
+    tr = translator_new(&cfg, loop);
+    translator_set_protocols(tr, (struct ipsc *)1, (struct hbp *)1);
+    ncap = 0;
+    fi = fopen("tests/parity_in.txt", "r");
+    for (int k = 0; k < 3 && fi && fgets(line, sizeof line, fi); k++) {
+        int ts, bt; char hex[400];
+        if (sscanf(line, "%d %d %399s", &ts, &bt, hex) != 3) continue;
+        uint8_t raw[400]; int n = unhex(hex, raw);
+        if (k >= 1) {
+            const int *w = want[k - 1];
+            if (w[0]) raw[32] |= 0x01;
+            if (w[1]) raw[33 + 49 / 8] |= (uint8_t)(0x80 >> (49 % 8));
+            if (w[2]) raw[33 + 99 / 8] |= (uint8_t)(0x80 >> (99 % 8));
+        }
+        translator_ipsc_voice_received(tr, raw, n, ts, bt);
+    }
+    if (fi) fclose(fi);
+    if (ncap != 3) { fprintf(stderr, "FAIL bad-voice: expected 3 DMRD, got %d\n", ncap); bad_fails++; }
+    for (int v = 0; v < 2 && v + 1 < ncap; v++) {
+        dmr_bit b[264]; dmr_bytes_to_bits(cap[v + 1] + 20, 33, b);
+        dmr_bit f[3][72];
+        memcpy(f[0], b, 72);
+        memcpy(f[1], b + 72, 36); memcpy(f[1] + 36, b + 156, 36);
+        memcpy(f[2], b + 192, 72);
+        dmr_bit s[72]; dmr_bytes_to_bits(SIL, 9, s);
+        for (int i = 0; i < 3; i++) {
+            int is_sil = memcmp(f[i], s, sizeof s) == 0;
+            if (is_sil != want[v][i]) {
+                fprintf(stderr, "FAIL bad-voice: voice %d frame %d silence=%d, want %d\n", v, i + 1, is_sil, want[v][i]);
+                bad_fails++;
+            }
+        }
+    }
+    printf("Bad-voice flags (IPSC->HBP): %d failures\n", bad_fails);
 
     translator_free(tr); ev_free(loop);
-    return (fails || in_fails) ? 1 : 0;
+    return (fails || in_fails || bad_fails) ? 1 : 0;
 }

@@ -102,6 +102,10 @@ static void rand4(uint8_t out[4])
     if (getrandom(out, 4, 0) != 4) { out[0]=rand(); out[1]=rand(); out[2]=rand(); out[3]=rand(); }
 }
 
+/* 72-bit AMBE silence frame from MMDVMHost DMR_SILENCE_DATA; replaces frames the
+ * repeater flagged bad (IPSC->HBP). */
+static const uint8_t AMBE_SILENCE_MMDVM[9] = {0xB9,0xE8,0x81,0x52,0x61,0x73,0x00,0x2A,0x6B};
+
 /* precompute 19-byte IPSC AMBE payload of three silence frames */
 static void make_ambe_silence(uint8_t out[19])
 {
@@ -424,11 +428,16 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
          * bytes on a TA superframe); all AMBE is forwarded under the locked identity. */
         if (len < 52) { LOGW(LOGN, "SLOT_VOICE too short for AMBE: %d bytes", len); return; }
 
-        dmr_bit raw[152]; dmr_bytes_to_bits(data + 33, 19, raw);
+        dmr_bit raw[152]; dmr_bytes_to_bits(data + GV_AMBE_OFF, 19, raw);
         dmr_bit a1_72[72], a2_72[72], a3_72[72];
-        dmr_ambe_49_to_72(raw + 0,   a1_72);
-        dmr_ambe_49_to_72(raw + 50,  a2_72);
-        dmr_ambe_49_to_72(raw + 100, a3_72);
+        dmr_bit *a72[3] = {a1_72, a2_72, a3_72};
+        int bad[3] = {data[GV_BAD1_OFF] & GV_BAD1_MSK, raw[GV_BAD2_BIT], raw[GV_BAD3_BIT]};
+        for (int i = 0; i < 3; i++) {
+            if (bad[i]) dmr_bytes_to_bits(AMBE_SILENCE_MMDVM, 9, a72[i]);
+            else        dmr_ambe_49_to_72(raw + 50 * i, a72[i]);
+        }
+        if (bad[0] || bad[1] || bad[2])
+            LOGD(LOGN, "IPSC bad AMBE ts=%d flags=%d%d%d — sent as silence", ts, bad[0], bad[1], bad[2]);
         int pos = tr->out_frame_pos[ts] % 6;
         dmr_bit embed[48]; build_embed(tr, ts, pos, embed);
         dmr_bit fb[264]; int at=0;
