@@ -3,6 +3,7 @@ ipsc2hbp.toml
 
 # Build artifacts
 *.o
+*.d
 *.a
 /ipsc2hbpc
 

@@ -27,7 +27,11 @@ SOURCES := \
 	$(DMR_DIR)/ambe.c
 
 OBJECTS := $(SOURCES:.c=.o)
+DEPS    := $(OBJECTS:.o=.d)
 BIN     := ipsc2hbpc
+
+# Header dependencies: each .o is rebuilt when any header it includes changes.
+DEPFLAGS := -MMD -MP
 
 # DMR module sources (used by the standalone DSP self-test)
 DMR_SOURCES := $(filter $(DMR_DIR)/%,$(SOURCES))
@@ -81,7 +85,9 @@ $(BIN): $(OBJECTS)
 	$(CC) $(CFLAGS) -o $@ $(OBJECTS) $(LDFLAGS)
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
+
+-include $(DEPS)
 
 # Translator/DSP sources used by the test harnesses (no ipsc/hbp/main)
 TEST_SUPPORT := $(SRC_DIR)/config.c $(SRC_DIR)/toml.c $(SRC_DIR)/log.c \
@@ -100,4 +106,4 @@ test: tests/test_dsp.c tests/test_parity.c tests/test_private.c $(TEST_SUPPORT)
 	/tmp/ipsc2hbpc_test_private
 
 clean:
-	rm -f $(OBJECTS) $(BIN)
+	rm -f $(OBJECTS) $(DEPS) $(BIN)
