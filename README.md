@@ -61,7 +61,7 @@ See `INSTALL.md` for the systemd service and a note on coexisting with the Pytho
 
 **PROPERTY:**
 
-This work represents the author's interpretation of the Motorola MOTOTRBO IPSC protocol and the HomeBrew Repeater Protocol. IPSC protocol behavior is derived from reverse-engineering work originally done in DMRlink. HBP behavior is derived from HBlink, HBlink3, and HBlink4. The DMR DSP/FEC code is a C port of `dmr_utils3` (N0MJS, with original AMBE work by Mike Zingman N4IRR and FEC routines after Jonathan Naylor G4KLX). Motorola and MOTOTRBO are registered trademarks of Motorola Solutions, Inc. This project is not affiliated with Motorola Solutions in any way.
+This work represents the author's interpretation of the Motorola MOTOTRBO IPSC protocol and the HomeBrew Repeater Protocol. IPSC protocol behavior is derived from reverse-engineering work originally done in DMRlink. HBP behavior is derived from HBlink, HBlink3, and HBlink4. The DMR DSP/FEC code is a C port of `dmr_utils3` (N0MJS, with original AMBE work by Mike Zingman N4IRR and FEC routines after Jonathan Naylor G4KLX). Private (unit-to-unit) call support is based on a patch contributed by Marco Brunozzi IW0RED. Motorola and MOTOTRBO are registered trademarks of Motorola Solutions, Inc. This project is not affiliated with Motorola Solutions in any way.
 
 Additional IPSC packet structure knowledge was derived from study of **node-dmr-lib** by rick51231: https://github.com/rick51231/node-dmr-lib
 
