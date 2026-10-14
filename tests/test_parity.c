@@ -242,7 +242,14 @@ int main(void)
     static const int rs_new[2][5] = {{65, 65, 65, 65, 63}, {112, 112, 113, 113, -1}};
     int rs_fails = 0;
     for (int old = 0; old < 2; old++) {
-        Config c2 = cfg; c2.ipsc_rssi_old = old;
+        /* Parse the encoding from a real config file, so the accepted values are tested too. */
+        Config c2;
+        if (config_load(old ? "tests/rssi_old.toml" : "tests/parity.toml", &c2, err, sizeof err) ||
+            c2.ipsc_rssi_old != old) {
+            fprintf(stderr, "FAIL rssi: rssi_encoding_new = %s not loaded as the %s encoding: %s\n",
+                    old ? "false" : "true", old ? "old" : "new", err);
+            rs_fails++; continue;
+        }
         for (int fidx = 0; fidx < 2; fidx++) {
             tr = translator_new(&c2, loop);
             translator_set_protocols(tr, (struct ipsc *)1, (struct hbp *)1);

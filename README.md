@@ -39,7 +39,7 @@ The Python `ipsc2hbp` is a single asyncio process — already simple and effecti
 - The parity test confirms the C translator emits byte-identical DMRD (IPSC→HBP) and GROUP_VOICE (HBP→IPSC) frames versus the Python `ipsc2hbp`. The same program also replays weak-signal calls captured from a MOTOTRBO repeater to check bad-voice silence, burst-A re-sync, late entry on a degraded burst E, and RSSI decoding.
 - The private-call test replays private calls captured from a MOTOTRBO repeater and HBlink3, in both directions, full and late entry.
 
-Private calls, RSSI forwarding, bad-voice silence and burst-A re-sync are in the C version only; the Python `ipsc2hbp` does not have them. The configuration file is still shared: the one new key, `[ipsc] rssi_encoding`, is optional.
+Private calls, RSSI forwarding, bad-voice silence and burst-A re-sync are in the C version only; the Python `ipsc2hbp` does not have them. The configuration file is still shared: the one new key, `[ipsc] rssi_encoding_new`, is optional.
 
 **WHAT IT IS NOT:**
 

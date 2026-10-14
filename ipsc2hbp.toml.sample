@@ -116,15 +116,15 @@ ts_prefer_call_info = false
 # every other DMRD carries 0, HBP's "no reading" value.
 #
 # MOTOTRBO firmware has used two encodings of this value:
-#   "new" : 8.8 fixed-point -dBm
-#   "old" : the same, offset by 56 dB (raw 0 = -56 dBm)
+#   rssi_encoding_new = true  : 8.8 fixed-point -dBm (newer firmware)
+#   rssi_encoding_new = false : the same, offset by 56 dB (raw 0 = -56 dBm)
 # The change is believed to be around repeater firmware 2.30.10.0, but that
-# version is not confirmed.  Only "new" has been tested on a repeater.  If the
-# levels reported are about 56 dB too strong, try "old".
+# version is not confirmed.  Only true has been tested on a repeater.  If the
+# levels reported are about 56 dB too strong, set it to false.
 #
 # Decoding and both encodings from node-dmr-lib by rick51231 (MIT licence).
 # ---------------------------------------------------------------------------
-rssi_encoding = "new"
+rssi_encoding_new = true
 
 # ---------------------------------------------------------------------------
 # IPSC capability advertisement
