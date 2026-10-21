@@ -68,6 +68,7 @@
 #define GV_BAD2_BIT       49   /* AMBE field bit: frame 2 uncorrectable */
 #define GV_BAD3_BIT       99   /* AMBE field bit: frame 3 uncorrectable */
 /* VOICE_HEAD / VOICE_TERM payload (after node-dmr-lib DMRDataPayload) */
+#define GV_PDU_SLOT_MSK   0x80 /* byte 31 bit 7: timeslot 2 */
 #define GV_RSSI_FLAG_OFF  34   /* bit 7: RSSI present */
 #define GV_RSSI_FLAG_MSK  0x80
 #define GV_SLOTTYPE_OFF   35   /* bit 3: 2-byte slot type follows the data */

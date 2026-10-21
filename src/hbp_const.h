@@ -14,7 +14,8 @@
 #define HBPF_DTYPE_MASK        0x0F
 
 /* DMRD packet layout */
-#define DMRD_LEN          55
+#define DMRD_LEN          55   /* as sent: core + BER + RSSI */
+#define DMRD_CORE_LEN     53   /* minimum accepted: BER and RSSI are absent below 55 */
 #define DMRD_SEQ_OFF      4
 #define DMRD_SRC_OFF      5
 #define DMRD_DST_OFF      8

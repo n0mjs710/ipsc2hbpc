@@ -1,5 +1,5 @@
-# Config fixture for the byte-for-byte parity test (mirrors the Python tests/test.toml
-# fields that affect translator output: hbp_repeater_id and ipsc_master_id).
+# parity.toml plus the retired [ipsc] rssi_encoding_new key: an existing config that still
+# carries it must load, and RSSI must decode the same as without it.
 [global]
 log_level = "WARNING"
 [ipsc]

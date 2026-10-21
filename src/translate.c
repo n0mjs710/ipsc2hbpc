@@ -63,6 +63,7 @@ struct translator {
     int      in_buf_present[3][6];
     uint8_t  in_buf[3][6][19];
     int      in_term_pending[3];      /* terminator received; emit after tail drains */
+    uint8_t  in_term_rssi[3];         /* DMRD byte 54 of that terminator; 0 = no reading */
     double   in_next_slot_time[3];
     int      in_burst_pos[3];
     int      in_consec_synth[3];
@@ -142,21 +143,24 @@ static void extract_ambe_from_dmrd(const uint8_t payload33[33], uint8_t out19[19
     dmr_bits_to_bytes(bits, 152, out19);
 }
 
-/* build the 23-byte VOICE_HEAD/VOICE_TERM payload (after burst-type byte) */
-static void build_ipsc_voice_payload(const uint8_t lc[9], int burst_type, uint8_t out[23])
+/* build the 23-byte VOICE_HEAD/VOICE_TERM payload (after burst-type byte); rssi_raw is
+ * the 16-bit RSSI field, 0 = no reading */
+static void build_ipsc_voice_payload(const uint8_t lc[9], int burst_type, int ts, uint16_t rssi_raw,
+                                     uint8_t out[23])
 {
     uint8_t fec[3];
     dmr_rs129_lc_encode(lc, burst_type == VOICE_TERM ? 1 : 0, fec);
     uint8_t tag = (burst_type == VOICE_HEAD) ? 0x11 : 0x12;
     int p = 0;
-    out[p++] = 0x80;
+    out[p++] = (ts == 2) ? GV_PDU_SLOT_MSK : 0x00;
     out[p++] = 0x00; out[p++] = 0x0a;   /* length_to_follow = 10 */
     out[p++] = 0x80;
     out[p++] = 0x0a;
     out[p++] = 0x00; out[p++] = 0x60;   /* data size = 96 bits */
     memcpy(out + p, lc, 9); p += 9;
     memcpy(out + p, fec, 3); p += 3;
-    out[p++] = 0x00; out[p++] = tag; out[p++] = 0x00; out[p++] = 0x00;
+    out[p++] = 0x00; out[p++] = tag;
+    out[p++] = (uint8_t)(rssi_raw >> 8); out[p++] = (uint8_t)rssi_raw;
 }
 
 /* 48-bit EMBED for superframe position 0..5 */
@@ -250,6 +254,7 @@ static void init_call_state(translator *tr)
     tr->in_last_pkt[1]=tr->in_last_pkt[2]=0.0;
     memset(tr->in_buf_present, 0, sizeof tr->in_buf_present);
     tr->in_term_pending[1]=tr->in_term_pending[2]=0;
+    tr->in_term_rssi[1]=tr->in_term_rssi[2]=0;
     tr->in_next_slot_time[1]=tr->in_next_slot_time[2]=0.0;
     tr->in_burst_pos[1]=tr->in_burst_pos[2]=0;
     tr->in_consec_synth[1]=tr->in_consec_synth[2]=0;
@@ -302,9 +307,9 @@ static int out_call_continues(uint32_t rtp_now, int has_rtp, uint32_t prev_rtp, 
 }
 
 /* RSSI carried in a VOICE_HEAD / VOICE_TERM, as the DMRD byte-54 value (-dBm magnitude);
- * 0 = no reading.  The raw value is 8.8 fixed-point -dBm; the old firmware encoding adds a
- * 56 dB offset (node-dmr-lib, rick51231).  Voice bursts carry no RSSI. */
-static uint8_t ipsc_rssi(const translator *tr, const uint8_t *d, int len)
+ * 0 = no reading.  The raw value is 8.8 fixed-point -dBm (node-dmr-lib, rick51231).  Voice
+ * bursts carry no RSSI. */
+static uint8_t ipsc_rssi(const uint8_t *d, int len)
 {
     if (len < GV_DATA_OFF || !(d[GV_RSSI_FLAG_OFF] & GV_RSSI_FLAG_MSK)) return 0;
     int bits = (d[GV_DATA_BITS_OFF] << 8) | d[GV_DATA_BITS_OFF + 1];
@@ -313,8 +318,13 @@ static uint8_t ipsc_rssi(const translator *tr, const uint8_t *d, int len)
     int raw = (d[off] << 8) | d[off + 1];
     if (raw == 0) return 0;
     int v = (raw + 128) >> 8;
-    if (tr->cfg->ipsc_rssi_old) v += 56;
     return (uint8_t)(v > 255 ? 255 : v);
+}
+
+/* Inverse of ipsc_rssi(): DMRD byte-54 magnitude -> 16-bit IPSC RSSI field; 0 = no reading. */
+static uint16_t ipsc_rssi_raw(uint8_t mag)
+{
+    return (uint16_t)(mag << 8);
 }
 
 void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len, int ts, int burst_type)
@@ -400,7 +410,7 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
         memcpy(fb+at, full_lc+98, 98); at+=98;
         dmr_bits_to_bytes(fb, 264, payload_33);
         flags |= HBPF_FRAMETYPE_DATASYNC | HBPF_SLT_VHEAD;
-        rssi = ipsc_rssi(tr, data, len);
+        rssi = ipsc_rssi(data, len);
     } else if (burst_type == VOICE_TERM) {
         if (!tr->out_has_stream[ts]) return;
         uint8_t lc[9];
@@ -415,7 +425,7 @@ void translator_ipsc_voice_received(translator *tr, const uint8_t *data, int len
         memcpy(fb+at, full_lc+98, 98); at+=98;
         dmr_bits_to_bytes(fb, 264, payload_33);
         flags |= HBPF_FRAMETYPE_DATASYNC | HBPF_SLT_VTERM;
-        rssi = ipsc_rssi(tr, data, len);
+        rssi = ipsc_rssi(data, len);
     } else {
         /* SLOT1_VOICE / SLOT2_VOICE.  Boundary detection: the IPSC call-seq (byte 5) is
          * deliberately NOT consulted — current XPR8400 firmware mints a new call-seq every
@@ -587,6 +597,7 @@ static void clear_in_call(translator *tr, int ts)
     cancel_delivery_timer(tr, ts);
     memset(tr->in_buf_present[ts], 0, sizeof tr->in_buf_present[ts]);
     tr->in_term_pending[ts] = 0;
+    tr->in_term_rssi[ts] = 0;
     tr->in_next_slot_time[ts] = 0.0;
     tr->in_burst_pos[ts] = 0;
     tr->in_consec_synth[ts] = 0;
@@ -617,7 +628,7 @@ static void emit_term(translator *tr, int ts)
     const uint8_t *lc = tr->in_lc[ts];
     int call_info = ((ts == 2) ? TS_CALL_MSK : 0x00) | END_MSK;
     uint8_t gv_payload[24]; gv_payload[0]=VOICE_TERM;
-    build_ipsc_voice_payload(lc, VOICE_TERM, gv_payload+1);
+    build_ipsc_voice_payload(lc, VOICE_TERM, ts, ipsc_rssi_raw(tr->in_term_rssi[ts]), gv_payload+1);
     emit_in(tr, ts, lc, call_info, 0x5e, gv_payload, 24, 0);
     LOGI(LOGN, "HBP call end:   src=%u  %s=%u  ts=%d  ipsc_id=0x%02x",
          (unsigned)(lc[6]<<16|lc[7]<<8|lc[8]), (lc[0] & 0x3F) == FLCO_PRIVATE ? "unit" : "tg",
@@ -674,7 +685,8 @@ static void on_stream_timeout(translator *tr, int ts)
 void translator_hbp_voice_received(translator *tr, const uint8_t *dmrd, int len)
 {
     if (!ipsc_has_peers(tr->ip)) return;
-    if (len < DMRD_LEN) return;
+    if (len < DMRD_CORE_LEN) return;
+    uint8_t rssi = (len > DMRD_RSSI_OFF) ? dmrd[DMRD_RSSI_OFF] : 0;
 
     const uint8_t *src_sub   = dmrd + DMRD_SRC_OFF;
     const uint8_t *dst_group = dmrd + DMRD_DST_OFF;
@@ -721,7 +733,7 @@ void translator_hbp_voice_received(translator *tr, const uint8_t *dmrd, int len)
         {
             int call_info = (ts == 2) ? TS_CALL_MSK : 0x00;
             uint8_t gv_payload[24]; gv_payload[0]=VOICE_HEAD;
-            build_ipsc_voice_payload(lc, VOICE_HEAD, gv_payload+1);
+            build_ipsc_voice_payload(lc, VOICE_HEAD, ts, ipsc_rssi_raw(rssi), gv_payload+1);
             emit_in(tr, ts, lc, call_info, 0xdd, gv_payload, 24, 0);
         }
         return;
@@ -740,6 +752,7 @@ void translator_hbp_voice_received(translator *tr, const uint8_t *dmrd, int len)
         }
         /* Mark pending so the call tail isn't clipped. */
         tr->in_term_pending[ts] = 1;
+        tr->in_term_rssi[ts] = rssi;
         if (clock_idle(tr, ts)) {
             /* No buffered voice tail to drain — emit the terminator now. */
             emit_term(tr, ts);

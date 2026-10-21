@@ -30,7 +30,6 @@ typedef struct {
     uint8_t  ipsc_version[4];       /* 4 bytes */
 
     int      ipsc_ts_prefer_call_info;
-    int      ipsc_rssi_old;         /* 1 = [ipsc] rssi_encoding_new = false: old RSSI encoding (-56 dB offset) */
 
     /* connection mode */
     char     ipsc_mode[8];          /* "MASTER" | "PEER" */
