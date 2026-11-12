@@ -13,7 +13,13 @@
 
 #define LOGN "translate.translator"
 
-#define MAX_SYNTH_BURSTS    6
+/* HBP->IPSC: a burst missing at its delivery slot is filled with silence; the
+ * call is ended (synthesized VOICE_TERM) only after this many in a row, 1.5 s.
+ * A network call pauses: internet jitter, a partner network stalling a few
+ * hundred ms.  Ending it at 360 ms cut live calls in two (the next burst came
+ * back as a late entry, a new call to the repeater).  1.5 s is MMDVMHost's
+ * network watchdog (DMRSlot m_networkWatchdog); it fills silence until then. */
+#define MAX_SYNTH_BURSTS    25
 #define SLOT_MS             0.060
 
 /* IPSC->HBP call-boundary threshold. Current XPR8400 firmware churns the IPSC
@@ -800,10 +806,14 @@ void translator_check_call_timeouts(translator *tr)
 {
     /* Dead-man cleanup for a lost VOICE_TERM with no follow-on call (a real new
      * call resets stale state inline via RTP discontinuity).  2 s keeps the
-     * logged call-end close to reality; it sits well above every in-call wait
-     * (60 ms burst, 120 ms jitter, 360 ms synth).  Rides the ~5 s watchdog, so
-     * effective clearing is ~2-7 s — fine for a dead-man. */
+     * logged call-end close to reality.  HBP->IPSC waits longer: the delivery
+     * clock synthesizes the VOICE_TERM (jitter_buffer_depth + MAX_SYNTH_BURSTS)
+     * slots after the last burst, 1.62 s at the default depth, 1.98 s at depth
+     * 8, and the dead-man must not clear the call before that TERM goes out.
+     * Rides the ~5 s watchdog, so effective clearing is ~2-7 s — fine for a
+     * dead-man. */
     double timeout = 2.0;
+    double in_timeout = (tr->cfg->jitter_buffer_depth + MAX_SYNTH_BURSTS) * SLOT_MS + 0.5;
     double now = ev_now(tr->loop);
     for (int ts = 1; ts <= 2; ts++) {
         if (tr->out_has_stream[ts]) {
@@ -817,7 +827,7 @@ void translator_check_call_timeouts(translator *tr)
         }
         if (tr->in_has_lc[ts]) {
             double el = now - tr->in_last_pkt[ts];
-            if (el > timeout) {
+            if (el > in_timeout) {
                 LOGW(LOGN, "HBP->IPSC call timeout: ts=%d — no voice for %.1fs, clearing", ts, el);
                 clear_in_call(tr, ts);
             }

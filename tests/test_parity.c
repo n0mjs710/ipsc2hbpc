@@ -347,7 +347,7 @@ int main(void)
         /* call 2: HEAD, one voice burst, then the stream stops -> synthesized TERM */
         memcpy(d, dm[0], 55); d[16] ^= 0x0F; translator_hbp_voice_received(tr, d, 55);
         d[15] = (d[15] & 0xC0) | HBPF_FRAMETYPE_VOICESYNC; translator_hbp_voice_received(tr, d, 55);
-        ev_timer_after(loop, 0.8, stop_cb, loop);
+        ev_timer_after(loop, 2.0, stop_cb, loop);   /* the stream timeout is 1.5 s (MAX_SYNTH_BURSTS) */
         ev_run(loop);
         if (ngv < 4 || gvcap[1][30] != 0x02 || (gvcap[1][52] << 8 | gvcap[1][53]) != 90 << 8 ||
             gvcap[ngv - 1][30] != 0x02 || (gvcap[ngv - 1][52] | gvcap[ngv - 1][53]) != 0) {
