@@ -34,10 +34,11 @@ The Python `ipsc2hbp` is a single asyncio process — already simple and effecti
 
 **VERIFICATION:**
 
-`make test` runs three suites:
+`make test` runs four suites:
 - The DSP self-test confirms every FEC/DSP primitive matches `dmr_utils3` bit-for-bit.
 - The parity test confirms the C translator emits byte-identical DMRD (IPSC→HBP) and GROUP_VOICE (HBP→IPSC) frames versus the Python `ipsc2hbp`. The same program also replays weak-signal calls captured from a MOTOTRBO repeater to check bad-voice silence, burst-A re-sync, late entry on a degraded burst E, and RSSI decoding, and checks HBP→IPSC RSSI encoding, the timeslot bit, and 53-byte DMRD.
 - The private-call test replays private calls captured from a MOTOTRBO repeater and HBlink3, in both directions, full and late entry.
+- The HBP gap test checks that a pause inside a network call is filled with silence rather than ending the call, and that a call whose VOICE_TERM is lost is ended after 1.5 s.
 
 The Python `ipsc2hbp` has the same features and runs the same captured fixtures in its own tests. The configuration file is shared.
 
